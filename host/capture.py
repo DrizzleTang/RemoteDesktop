@@ -26,6 +26,8 @@ from dataclasses import dataclass
 import numpy as np
 from PIL import Image
 
+from common.protocol import FMT_JPEG, FMT_WEBP
+
 # JPEG 质量的合法区间:低于 5 画面已经不可用,高于 95 体积暴涨而肉眼无差别。
 MIN_JPEG_QUALITY = 5
 MAX_JPEG_QUALITY = 95
@@ -184,18 +186,49 @@ class ScreenCapture:
         capture_ms = (time.perf_counter() - t0) * 1000.0
         return CapturedFrame(rgb=rgb, width=out_w, height=out_h, capture_ms=capture_ms)
 
-    def encode_jpeg(self, rgb: np.ndarray, quality: int) -> bytes:
-        """把 (H, W, 3) 的 RGB 数组编码成 JPEG 字节。"""
+    def grab_full(self) -> CapturedFrame:
+        """采集一帧原始分辨率画面(不缩放)。
+
+        共享采集管线用这个:差分在原始分辨率上做,缩放推迟到"确实要发送"
+        的时候再按需进行,画面静止时可以完全省掉缩放开销。
+        """
+        return self.grab(scale=1.0)
+
+    def rescale(self, rgb: np.ndarray, scale: float) -> tuple[np.ndarray, int, int]:
+        """把原始画面缩放到目标比例,返回 (数组, 宽, 高)。scale>=1 时原样返回。"""
+        full_h, full_w = rgb.shape[0], rgb.shape[1]
+        scale = max(MIN_SCALE, min(1.0, float(scale)))
+        if scale >= 0.999:
+            return rgb, full_w, full_h
+        out_w = max(1, round(full_w * scale))
+        out_h = max(1, round(full_h * scale))
+        img = Image.fromarray(np.ascontiguousarray(rgb)).resize((out_w, out_h), Image.BILINEAR)
+        return np.asarray(img), out_w, out_h
+
+    def encode_image(self, rgb: np.ndarray, quality: int, fmt: int = FMT_JPEG) -> bytes:
+        """把 (H, W, 3) 的 RGB 数组编码成 JPEG 或 WebP 字节。
+
+        WebP 一律用 method=0(最快档)。默认档的压缩率只好一点点,编码耗时
+        却是 4 倍以上(实测整屏 1920x1080:默认档 135ms vs 最快档 29ms),
+        对实时推流完全不可接受。
+        """
         if rgb.ndim != 3 or rgb.shape[2] != 3:
             raise ValueError(f"rgb 必须是 (H, W, 3) 的数组,实际为 {rgb.shape}")
         img = Image.fromarray(np.ascontiguousarray(rgb, dtype=np.uint8))
         buf = io.BytesIO()
-        img.save(buf, format="JPEG", quality=_clamp_quality(quality))
+        if fmt == FMT_WEBP:
+            img.save(buf, format="WEBP", quality=_clamp_quality(quality), method=0)
+        else:
+            img.save(buf, format="JPEG", quality=_clamp_quality(quality))
         return buf.getvalue()
 
+    def encode_jpeg(self, rgb: np.ndarray, quality: int) -> bytes:
+        """[兼容别名] 等价于 encode_image(..., fmt=FMT_JPEG)。"""
+        return self.encode_image(rgb, quality, FMT_JPEG)
+
     def encode_region(self, rgb: np.ndarray, rect: tuple[int, int, int, int],
-                      quality: int) -> bytes:
-        """裁剪出 rect=(x, y, w, h) 区域并编码成 JPEG。
+                      quality: int, fmt: int = FMT_JPEG) -> bytes:
+        """裁剪出 rect=(x, y, w, h) 区域并编码。
 
         rect 会被裁剪到图像边界内(容错:即使上游给了略微越界的矩形也不会崩),
         但裁剪后为空则视为调用方的 bug,抛 ValueError。
@@ -210,7 +243,7 @@ class ScreenCapture:
         y1 = max(y0, min(y + h, img_h))
         if x1 <= x0 or y1 <= y0:
             raise ValueError(f"矩形 {rect} 与图像 {img_w}x{img_h} 无交集")
-        return self.encode_jpeg(rgb[y0:y1, x0:x1], quality)
+        return self.encode_image(rgb[y0:y1, x0:x1], quality, fmt)
 
     def close(self) -> None:
         if self._sct is not None:

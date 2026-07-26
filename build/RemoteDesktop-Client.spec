@@ -39,13 +39,22 @@ a = Analysis(
     datas=[
         (os.path.join(REPO_ROOT, 'client', 'static'), os.path.join('client', 'static')),
     ],
-    hiddenimports=[
-        'websockets',
-    ],
+    hiddenimports=[],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    # 排除运行时完全用不到的重型模块,显著减小 exe 体积:
+    #   numpy 自带的 distutils/f2py/测试套件约 5MB;tkinter/matplotlib 等本项目
+    #   从未使用,但 PyInstaller 的依赖分析有时会把它们连带进来。
+    # 主控端只是一个静态文件服务器 + 打开浏览器,全部用标准库实现,
+    # 完全不需要 numpy/Pillow/cryptography/mss/pynput 这些被控端专用的重型
+    # 依赖(真正的客户端逻辑跑在浏览器里)。全部排除可以让这个 exe 小很多。
+    excludes=[
+        'numpy', 'PIL', 'cryptography', 'mss', 'pynput', 'pyperclip', 'pystray',
+        'tkinter', 'matplotlib', 'scipy', 'pandas', 'pytest', '_pytest',
+        'setuptools', 'pip', 'wheel', 'doctest', 'pdb', 'unittest',
+        'PIL.ImageQt', 'PIL.ImageTk',
+    ],
     noarchive=False,
     optimize=0,
 )

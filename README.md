@@ -10,14 +10,16 @@
 
 - **弱网优先的自适应画质**:实时测量延迟,在 5 个档位间自动切换,快降慢升
 - **增量传输**:只发送屏幕上变化的区域;画面静止时一个字节都不发
+- **WebP 编码**:增量帧比 JPEG 省 80% 以上流量,关键帧按瓶颈在网络还是 CPU 动态选择
 - **实时延迟显示**,并区分"网络慢"还是"对方电脑慢"
 - **完整的鼠标键盘控制**,支持组合键、长按、滚轮
 - **剪贴板双向同步**
-- **文件传输**:拖拽即可把文件发到对方电脑
+- **文件传输**:拖拽即可把文件发到对方电脑;也可从对方的共享目录下载文件
+- **远端鼠标光标**:显示对方指针的位置与形状(截屏本身不含指针)
 - **触屏支持**:手机/平板浏览器可用(轻点、拖动、长按右键、双指滚动)
 - **多显示器切换**
 - **多人只读观看**(可选),操作者离开时自动移交操作权
-- **断线自动重连**,重连期间用遮罩防止对着冻结画面误操作
+- **断线自动重连**,重连期间用遮罩防止对着冻结画面误操作;网络抖动后用一次性令牌快速恢复
 - **端到端加密**:密码永不上网,中转服务器无法窥探画面/按键/剪贴板
 - **两种连接方式**:局域网直连,或经中转服务器穿透 NAT
 
@@ -71,7 +73,8 @@ docker compose -f docker/docker-compose.yml up -d      # 或 python -m relay.mai
 2. **只传变化区域**:实测小块变化时流量仅为整屏传输的 8%;画面静止时完全不发送
 3. **快降慢升的自适应画质**:变差立刻降档保操作,变好要连续多次确认才升档,避免画质闪烁
 4. **控制信令优先**:鼠标键盘、剪贴板不会排在大视频帧后面
-5. **断线指数退避自动重连**:弱网下短暂断线是常态
+5. **断线指数退避自动重连**:弱网下短暂断线是常态;重连用一次性令牌跳过耗时的密码运算
+6. **区分"带宽打满"与"链路本身慢"**:两者的正确处置相反,只看延迟会误判
 
 详细设计与同类方案(TeamViewer / AnyDesk / 向日葵 / VNC / RDP)对比见
 [docs/architecture.md](docs/architecture.md)。
@@ -80,12 +83,14 @@ docker compose -f docker/docker-compose.yml up -d      # 或 python -m relay.mai
 
 ```
 common/     协议(protocol.py)、加密(crypto.py)、自适应画质算法(adaptive.py)
-host/       被控端:采集(capture.py)、差分(delta.py)、推流(streamer.py)、
-            输入注入(input_injector.py)、剪贴板、文件接收(filetransfer.py)、
+host/       被控端:共享采集管线(hub.py)、采集编码(capture.py)、差分(delta.py)、
+            推流策略(streamer.py)、光标(cursor.py)、输入注入(input_injector.py)、
+            剪贴板、文件收发(filetransfer.py/share.py)、恢复令牌(resume.py)、
             优先级发送队列(sendqueue.py)、托盘(tray.py)、会话编排(server.py)
-client/     主控端:static/js/ 下是 ES 模块化的浏览器客户端,main.py 是本地启动器
+client/     主控端:static/js/ 下是 ES 模块化的浏览器客户端,tests/ 是其单元测试
+            (含与 Python 侧的加密/协议交叉验证),main.py 是本地启动器
 relay/      中转服务器(零信任转发 + /healthz 健康检查 + 可选 TLS)
-tests/      单元测试(248 个)
+tests/      Python 单元测试
 scripts/    端到端联调脚本
 docs/       使用手册、架构设计、中转部署、relay 协议规范
 build/      Windows 打包(PyInstaller + Inno Setup)
@@ -99,12 +104,17 @@ docker/     中转服务器容器化部署
 
 ```bash
 pip install pytest pytest-asyncio
-pytest -q
+pytest -q                        # Python:288 个
+node --test client/tests/*.test.js   # 客户端 JS:42 个
 ```
 
+客户端 JS 测试里包含**与 Python 侧的交叉验证**:用 Python 生成的密文和二进制帧
+去验证 JS 的实现,确保两端的加密参数与字节布局完全一致——两侧各自单独测试
+全绿、但实际连不上,是这类项目最容易踩的坑。
+
 端到端联调(真实拉起 host + client + Xvfb + Playwright 驱动真实 Chromium,
-覆盖连接、增量编码、鼠标键盘触屏、剪贴板、文件传输、显示器切换、断线重连、
-多人观看共 29 项检查):
+覆盖连接、增量编码、WebP、远端光标、鼠标键盘触屏、剪贴板、双向文件传输、
+显示器切换、网络中断恢复、多人观看共 40 项检查):
 
 ```bash
 sudo apt-get install -y xvfb xdotool xclip

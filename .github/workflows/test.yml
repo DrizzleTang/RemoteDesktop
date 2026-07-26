@@ -89,3 +89,50 @@ jobs:
         # 所以 continue-on-error,红了也不会让整个 workflow 失败。
         continue-on-error: true
         run: ruff check . --output-format concise
+
+  js-tests:
+    name: 客户端 JS 单元测试
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: 安装 Python(用于校验加密向量是最新的)
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 安装 Python 依赖
+        run: pip install cryptography
+
+      - name: 校验交叉验证向量与当前协议一致
+        # 向量文件是 Python 生成、JS 消费的。如果有人改了协议或加密参数却忘了
+        # 重新生成向量,这里会检测到差异并让 CI 变红——否则两端悄悄不兼容,
+        # 单侧测试却依然全绿。
+        run: |
+          cp client/tests/fixtures/crypto_vectors.json /tmp/vectors_before.json
+          PYTHONPATH=. python client/tests/gen_vectors.py
+          python - <<'EOF'
+          import json, sys
+          before = json.load(open('/tmp/vectors_before.json'))
+          after = json.load(open('client/tests/fixtures/crypto_vectors.json'))
+          # 密文含随机 nonce,每次都不同,只比较确定性字段
+          keys = ['password', 'salt_b64', 'iterations', 'session_key_b64', 'resume_key_b64',
+                  'control_plaintext_b64', 'delta_plaintext_b64', 'keyframe_plaintext_b64',
+                  'file_chunk_plaintext_b64']
+          diff = [k for k in keys if before.get(k) != after.get(k)]
+          if diff:
+              print('以下字段与当前代码不一致,请重新运行 client/tests/gen_vectors.py 并提交:')
+              for k in diff:
+                  print(f'  {k}: 仓库里={before.get(k)!r} 当前代码={after.get(k)!r}')
+              sys.exit(1)
+          print('交叉验证向量与当前协议一致')
+          EOF
+
+      - name: 运行 JS 测试
+        run: node --test client/tests/*.test.js

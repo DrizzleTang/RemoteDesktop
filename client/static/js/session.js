@@ -8,8 +8,8 @@
 
 import { SessionCipher, CryptoError, validateKexInit } from './crypto.js';
 import {
-  MSG_CONTROL, MSG_VIDEO_FRAME, MSG_VIDEO_DELTA,
-  decodeKeyframe, decodeDelta, ProtocolError,
+  MSG_CONTROL, MSG_VIDEO_FRAME, MSG_VIDEO_DELTA, MSG_FILE_CHUNK,
+  decodeKeyframe, decodeDelta, decodeFileChunk, detectCodecs, ProtocolError,
 } from './protocol.js';
 
 const PING_INTERVAL_MS = 1000;
@@ -50,6 +50,10 @@ export class Session {
     this.manualClose = false;
     this.handshakeStarted = false;
     this.canControl = false;
+    // 恢复令牌只放在内存里(不写 localStorage):它等价于一次性凭据,
+    // 落盘会扩大泄露面,而重连都发生在同一个页面生命周期内,内存足够。
+    this.resumeToken = null;
+    this.codecs = ['jpeg'];
 
     this._handlers = new Map();
     this._reconnectAttempts = 0;
@@ -172,6 +176,11 @@ export class Session {
         this._onKexInit(msg);
         break;
       case 'kex_reject':
+        if (msg.reason === 'resume_failed') {
+          // 令牌过期/无效:被控端已切回密码通道,这里重发一条用密码派生的 hello
+          this._retryWithPassword();
+          return;
+        }
         this._fail(`连接被拒绝: ${REJECT_TEXT[msg.reason] || msg.reason || '未知原因'}`);
         break;
       default:
@@ -205,16 +214,47 @@ export class Session {
       return;
     }
 
+    this._pendingSalt = validated.saltBytes;
+    this._pendingIterations = validated.iterations;
     try {
-      this.cipher = await SessionCipher.derive(
-        this.params.password, validated.saltBytes, validated.iterations,
-      );
-      this._emit('status', { kind: 'connecting', text: '正在验证密码...' });
-      await this.sendControl({ t: 'hello', client_name: navigator.userAgent.slice(0, 60) });
+      const token = this.resumeToken;
+      if (token) {
+        // 有恢复令牌就走快速通道:直接用令牌派生密钥,省掉 20 万次 PBKDF2
+        // (浏览器里这一步可能要 100-300ms,弱网频繁重连时很吃亏)。
+        this.resumeToken = null; // 一次性:无论成败都不再复用
+        this.ws.send(JSON.stringify({ t: 'resume', id: token.id }));
+        this.cipher = await SessionCipher.fromResumeSecret(token.secret, validated.saltBytes);
+        this._emit('status', { kind: 'connecting', text: '正在快速重连...' });
+      } else {
+        this.cipher = await SessionCipher.derive(
+          this.params.password, validated.saltBytes, validated.iterations,
+        );
+        this._emit('status', { kind: 'connecting', text: '正在验证密码...' });
+      }
+      this.codecs = await detectCodecs();
+      await this.sendControl({
+        t: 'hello', client_name: navigator.userAgent.slice(0, 60), codecs: this.codecs,
+      });
       this._startPing();
     } catch (err) {
       console.error('密钥协商失败', err);
       this._fail('密钥协商失败,请确认浏览器支持 WebCrypto(需 HTTPS 或 localhost 环境)');
+    }
+  }
+
+  async _retryWithPassword() {
+    try {
+      this.cipher = await SessionCipher.derive(
+        this.params.password, this._pendingSalt, this._pendingIterations,
+      );
+      this._emit('status', { kind: 'connecting', text: '正在验证密码...' });
+      await this.sendControl({
+        t: 'hello', client_name: navigator.userAgent.slice(0, 60), codecs: this.codecs,
+      });
+      this._startPing();
+    } catch (err) {
+      console.error('退回密码认证失败', err);
+      this._fail('连接失败,请重试');
     }
   }
 
@@ -245,6 +285,8 @@ export class Session {
         this._emit('keyframe', decodeKeyframe(body));
       } else if (kind === MSG_VIDEO_DELTA) {
         this._emit('delta', decodeDelta(body));
+      } else if (kind === MSG_FILE_CHUNK) {
+        this._emit('fileChunk', decodeFileChunk(body));
       }
     } catch (err) {
       if (err instanceof ProtocolError) {
@@ -283,10 +325,24 @@ export class Session {
         this.canControl = msg.can_control === true;
         this._emit('viewer', msg);
         break;
+      case 'file_begin':
+      case 'file_end':
       case 'file_progress':
       case 'file_done':
       case 'file_error':
         this._emit('file', msg);
+        break;
+      case 'resume_token':
+        // 存下来,下次断线重连时用它跳过 PBKDF2
+        if (typeof msg.id === 'string' && typeof msg.secret === 'string') {
+          this.resumeToken = { id: msg.id, secret: msg.secret };
+        }
+        break;
+      case 'cursor':
+        this._emit('cursor', msg);
+        break;
+      case 'share_list':
+        this._emit('shareList', msg);
         break;
       default:
         break;

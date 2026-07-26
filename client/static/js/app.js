@@ -8,6 +8,8 @@ import { Renderer } from './render.js';
 import { InputCapture } from './input.js';
 import { FileUploader } from './transfer.js';
 import { UI, el } from './ui.js';
+import { CursorOverlay } from './cursor.js';
+import { formatBytes } from './transfer.js';
 
 const ui = new UI();
 const session = new Session();
@@ -25,8 +27,13 @@ const uploader = new FileUploader(session, {
   },
 });
 
+const cursorOverlay = new CursorOverlay(el('remote-cursor'));
+
 let connectMode = 'direct';
 let fileTransferEnabled = false;
+let shareAvailable = false;
+// 正在从被控端下载的文件:transferId -> { name, size, chunks[], received }
+const downloads = new Map();
 
 // ---------------------------------------------------------------------------
 // 输入采集:未连接或只读观看时,所有输入都不发送
@@ -73,6 +80,9 @@ session.on('ready', (msg) => {
   ui.setMonitors(msg.monitors, msg.current_monitor);
   fileTransferEnabled = msg.file_transfer === true;
   el('btn-send-file').style.display = fileTransferEnabled ? '' : 'none';
+  shareAvailable = msg.share_available === true;
+  el('btn-remote-files').style.display = shareAvailable ? '' : 'none';
+  cursorOverlay.reset();
   renderer.reset();
   if (msg.can_control !== false && msg.input_available === false) {
     ui.toastMessage('对方系统暂不支持输入注入,当前仅能观看画面', 4000);
@@ -82,7 +92,11 @@ session.on('ready', (msg) => {
 session.on('disconnected', () => {
   ui.showOverlay('连接已断开,正在自动重连…');
   renderer.reset();
+  cursorOverlay.reset();
 });
+
+// 远端光标:截屏不含指针,由被控端单独采集后叠加绘制
+session.on('cursor', (msg) => cursorOverlay.update(msg));
 
 session.on('latency', (rtt) => ui.setLatency(rtt));
 session.on('stats', (msg) => ui.setStats(msg));
@@ -137,7 +151,112 @@ session.on('viewer', (msg) => {
   }
 });
 
-session.on('file', (msg) => uploader.handleServerMessage(msg));
+session.on('file', (msg) => {
+  if (msg.t === 'file_begin' && msg.dir === 'down') {
+    // 被控端开始向我们推送一个文件
+    downloads.set(msg.id, { name: msg.name, size: msg.size, chunks: [], received: 0 });
+    ui.upsertTransfer(`d${msg.id}`, `⬇ ${msg.name}`, 0, msg.size);
+    return;
+  }
+  if (msg.t === 'file_end' && downloads.has(msg.id)) {
+    finishDownload(msg.id);
+    return;
+  }
+  if (msg.t === 'file_error' && downloads.has(msg.id)) {
+    const entry = downloads.get(msg.id);
+    downloads.delete(msg.id);
+    ui.setTransferError(`d${msg.id}`, entry.name, msg.message || '下载失败');
+    return;
+  }
+  uploader.handleServerMessage(msg);
+});
+
+session.on('fileChunk', (chunk) => {
+  const entry = downloads.get(chunk.transferId);
+  if (!entry) return;
+  // 复制一份:chunk.data 是解密缓冲区上的视图,缓冲区随后会被复用
+  entry.chunks.push(new Uint8Array(chunk.data));
+  entry.received += chunk.data.length;
+  ui.upsertTransfer(`d${chunk.transferId}`, `⬇ ${entry.name}`, entry.received, entry.size);
+});
+
+function finishDownload(id) {
+  const entry = downloads.get(id);
+  downloads.delete(id);
+  if (!entry) return;
+  const blob = new Blob(entry.chunks, { type: 'application/octet-stream' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = entry.name;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 30000);
+  ui.upsertTransfer(`d${id}`, `⬇ ${entry.name}`, 1, 1, 'done');
+  ui.toastMessage(`已下载:${entry.name}`);
+  setTimeout(() => ui.clearFinishedTransfers(), 4000);
+}
+
+// ---------------------------------------------------------------------------
+// 远端共享文件浏览
+// ---------------------------------------------------------------------------
+
+session.on('shareList', (msg) => {
+  const list = el('remote-files-list');
+  list.replaceChildren();
+
+  // 注意:msg 里的文字全部来自被控端,属于不可信输入,一律用 textContent
+  // 写入,绝不能拼进 innerHTML——否则一个恶意/被攻陷的被控端就能在主控端
+  // 的页面里执行脚本。
+  const showEmpty = (text) => {
+    const div = document.createElement('div');
+    div.className = 'remote-files-empty';
+    div.textContent = text;
+    list.appendChild(div);
+  };
+
+  if (!msg.ok) {
+    showEmpty(typeof msg.message === 'string' ? msg.message : '无法读取共享目录');
+    return;
+  }
+  if (!Array.isArray(msg.files) || msg.files.length === 0) {
+    showEmpty('共享目录里没有文件');
+    return;
+  }
+  for (const file of msg.files) {
+    if (!file || typeof file.name !== 'string') continue;
+    const row = document.createElement('div');
+    row.className = 'remote-file-row';
+    const name = document.createElement('div');
+    name.className = 'remote-file-name';
+    name.textContent = file.name;
+    name.title = file.name;
+    const size = document.createElement('div');
+    size.className = 'remote-file-size';
+    size.textContent = formatBytes(Number(file.size) || 0);
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.textContent = '下载';
+    btn.addEventListener('click', () => {
+      session.sendControl({ t: 'share_get', name: file.name });
+      ui.toastMessage(`正在下载 ${file.name} …`);
+    });
+    row.append(name, size, btn);
+    list.appendChild(row);
+  }
+});
+
+el('btn-remote-files').addEventListener('click', () => {
+  const panel = el('remote-files-panel');
+  const showing = panel.style.display !== 'none';
+  panel.style.display = showing ? 'none' : 'block';
+  if (!showing) session.sendControl({ t: 'share_list_req' });
+});
+
+el('btn-remote-files-close').addEventListener('click', () => {
+  el('remote-files-panel').style.display = 'none';
+});
 
 // ---------------------------------------------------------------------------
 // 连接表单

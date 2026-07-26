@@ -60,6 +60,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-viewers", type=int, default=1,
                         help="允许同时连接的会话总数(默认 1)。大于 1 时,第一个连上的持有操作权,"
                              "其余为只读观看者。仅直连模式有效,中转模式恒为 1")
+    parser.add_argument("--share-dir", default=None,
+                        help="共享给对方下载的目录(默认不开启)。对方只能下载该目录下的"
+                             "直接子文件,不能访问子目录或目录外的任何路径")
+    parser.add_argument("--no-cursor", action="store_true",
+                        help="不同步远端鼠标光标(截屏本身不含光标,默认会单独采集并同步)")
     parser.add_argument("--no-tray", action="store_true", help="不显示系统托盘图标")
     parser.add_argument("--log-level", default="INFO")
     return parser
@@ -82,6 +87,8 @@ def main() -> None:
         download_dir=Path(args.download_dir).expanduser(),
         max_viewers=max(1, args.max_viewers),
         allow_file_transfer=not args.no_file_transfer,
+        share_dir=Path(args.share_dir).expanduser() if args.share_dir else None,
+        show_cursor=not args.no_cursor,
     )
 
     if args.relay_url:
@@ -100,6 +107,8 @@ def main() -> None:
     print(f" 访问密码: {password}")
     if config.allow_file_transfer:
         print(f" 接收文件保存到: {config.download_dir}")
+    if config.share_dir is not None:
+        print(f" 对方可下载的共享目录: {config.share_dir}")
     if config.max_viewers > 1 and not args.relay_url:
         print(f" 最多同时 {config.max_viewers} 个连接(第 1 个可操作,其余只能观看)")
     print(" 请将以上连接信息告知需要连接的一方,在网页客户端中填写")

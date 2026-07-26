@@ -10,6 +10,8 @@
  * 字节时就发,否则测出来的延迟会偏小、自适应会误判网络比实际更好。
  */
 
+import { MIME_BY_FMT } from './protocol.js';
+
 export class Renderer {
   constructor(canvas) {
     this.canvas = canvas;
@@ -27,7 +29,8 @@ export class Renderer {
   }
 
   async drawKeyframe(frame) {
-    const bitmap = await createImageBitmap(new Blob([frame.imageBytes], { type: 'image/jpeg' }));
+    const mime = MIME_BY_FMT[frame.fmt] || 'image/jpeg';
+    const bitmap = await createImageBitmap(new Blob([frame.imageBytes], { type: mime }));
     try {
       if (this.canvas.width !== frame.width || this.canvas.height !== frame.height) {
         // 改 canvas 尺寸会清空内容,所以只在尺寸真的变了时才改
@@ -53,8 +56,9 @@ export class Renderer {
     }
 
     // 并行解码所有矩形,再统一绘制:解码是异步的,批量并行比逐个 await 快得多
+    const mime = MIME_BY_FMT[frame.fmt] || 'image/jpeg';
     const bitmaps = await Promise.all(frame.rects.map((rect) =>
-      createImageBitmap(new Blob([rect.imageBytes], { type: 'image/jpeg' }))));
+      createImageBitmap(new Blob([rect.imageBytes], { type: mime }))));
     try {
       for (let i = 0; i < bitmaps.length; i++) {
         const rect = frame.rects[i];

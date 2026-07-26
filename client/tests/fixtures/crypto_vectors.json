@@ -1,0 +1,14 @@
+{
+  "password": "测试密码-Test123",
+  "salt_b64": "AAECAwQFBgcICQoLDA0ODw==",
+  "iterations": 100000,
+  "session_key_b64": "xkT2Ak6phdj2IOm1GRlfnio3lQmmTPFCw3XpBAJ/RPQ=",
+  "control_ciphertext_b64": "x/pae/OQl8GHUTvczwGbpM2Ohft7DuA/vBmE99go0tWk0N0XTqVEJGoqsjyauHJfKvI+YA5WSniaqByXRQ5ojoOaiVbDUTDeOsdHDlxI9CDCmm7DAFAkeg==",
+  "control_plaintext_b64": "AXsidCI6ImhlbGxvX2FjayIsIndpZHRoIjoxOTIwLCJoZWlnaHQiOjEwODAsIuS4reaWhyI6IuWAvCJ9",
+  "resume_secret_b64": "ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8=",
+  "resume_key_b64": "irZiUZwNz5i+zzq2l9N0hVnGOYS91UUgtrXBTZqCAJI=",
+  "resume_ciphertext_b64": "yVLdr5rFE7DfH1+OBzctnKTixcvXPuog0ZlX88XX8JpumHFuPY9HoRbqRm0kZRY=",
+  "delta_plaintext_b64": "A/EAAAAqAAAwOQMgAlhGAQAAAgAKABQAHgAoAAAAAwECAwBkAMgACAAIAAAAAqq7",
+  "keyframe_plaintext_b64": "AvEAAAAHAAAD5wKAAeAyAAH/2ElNR//Z",
+  "file_chunk_plaintext_b64": "BAAAAAUAAAADaGVsbG8tY2h1bms="
+}

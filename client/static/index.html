@@ -73,6 +73,7 @@
     </div>
 
     <div class="toolbar-group">
+      <button type="button" id="btn-remote-files" title="浏览并下载被控端共享目录里的文件" style="display:none">远端文件</button>
       <button type="button" id="btn-send-file" title="发送文件到对方电脑(也可直接把文件拖到画面上)">发送文件</button>
       <button type="button" id="btn-send-clipboard" title="把本机剪贴板发送到对方">发送剪贴板</button>
       <button type="button" id="btn-fullscreen" title="全屏">全屏</button>
@@ -93,12 +94,21 @@
       <div id="screen-overlay-text">连接已断开,正在自动重连…</div>
       <div class="overlay-sub">画面为断线前的最后一帧,此时的操作不会生效</div>
     </div>
+    <div id="remote-cursor"></div>
     <div id="canvas-hint">点击画面开始操作(鼠标 / 键盘将被转发到对方电脑;可把文件拖到这里发送)</div>
   </div>
 
   <div id="transfer-panel" style="display:none">
     <div class="transfer-title">文件传输</div>
     <div id="transfer-list"></div>
+  </div>
+
+  <div id="remote-files-panel" style="display:none">
+    <div class="remote-files-head">
+      <span>被控端共享的文件</span>
+      <button type="button" id="btn-remote-files-close">关闭</button>
+    </div>
+    <div id="remote-files-list"></div>
   </div>
 </div>
 

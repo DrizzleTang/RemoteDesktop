@@ -43,7 +43,16 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    # 排除运行时完全用不到的重型模块,显著减小 exe 体积:
+    #   numpy 自带的 distutils/f2py/测试套件约 5MB;tkinter/matplotlib 等本项目
+    #   从未使用,但 PyInstaller 的依赖分析有时会把它们连带进来。
+    excludes=[
+        'numpy.distutils', 'numpy.f2py', 'numpy.testing', 'numpy.tests',
+        'numpy.random.tests', 'numpy.doc',
+        'tkinter', 'matplotlib', 'scipy', 'pandas', 'pytest', '_pytest',
+        'setuptools', 'pip', 'wheel', 'doctest', 'pdb', 'unittest',
+        'PIL.ImageQt', 'PIL.ImageTk',
+    ],
     noarchive=False,
     optimize=0,
 )

@@ -10,8 +10,8 @@
   的情况。
 
 无论哪种接入方式,配对成功后都会得到一个普通的 WebSocket 连接对象,
-后续的密钥交换、加密、收发逻辑完全一致,由 Session 类统一处理;而具体的
-画面推流策略在 host/streamer.py 里。
+后续的密钥交换、加密、收发逻辑完全一致,由 Session 类统一处理。采集与差分
+由所有会话共用的 host/hub.py 负责,单会话的推流策略在 host/streamer.py。
 
 多人观看:直连模式下可以允许额外的"只读观看者"接入(默认关闭,用
 --max-viewers 开启)。第一个连上的会话持有操作权,其余会话只能看画面,
@@ -37,6 +37,7 @@ from common.adaptive import AdaptiveController
 from common.protocol import (
     T_BYE,
     T_CLIPBOARD,
+    T_CURSOR,
     T_FILE_ABORT,
     T_FILE_BEGIN,
     T_FILE_DONE,
@@ -54,15 +55,22 @@ from common.protocol import (
     T_PING,
     T_PONG,
     T_QUALITY_SET,
+    T_RESUME_TOKEN,
+    T_SHARE_GET,
+    T_SHARE_LIST,
+    T_SHARE_LIST_REQ,
     T_STATS,
     T_VIEWER_INFO,
 )
 from host.capture import ScreenCapture
 from host.clipboard import ClipboardSync
-from host.delta import DirtyTracker
+from host.cursor import CursorCapture
 from host.filetransfer import FileReceiver, FileTransferError
+from host.hub import SharedCaptureHub
 from host.input_injector import InputInjector, InputUnavailableError
-from host.sendqueue import PRIORITY_CONTROL, PrioritySendQueue
+from host.resume import ResumeTokenStore, derive_from_resume
+from host.sendqueue import PRIORITY_CONTROL, PRIORITY_FILE, PrioritySendQueue
+from host.share import ShareDirectory, ShareError
 from host.streamer import FrameStreamer
 
 logger = logging.getLogger("host.server")
@@ -82,6 +90,7 @@ AUTH_BLOCK_S = 120.0
 # AUTH_BLOCK_S)。详见 docs/architecture.md "安全设计取舍说明"。
 RELAY_AUTH_BLOCK_S = 15.0
 MAX_WS_MESSAGE_BYTES = 8 * 1024 * 1024
+CURSOR_INTERVAL_S = 0.06  # 光标采样间隔(约 16Hz,足够跟手且开销很小)
 CLIPBOARD_MIN_APPLY_INTERVAL_S = 0.3  # 限制 clip 消息处理频率,避免被用来刷剪贴板子进程
 
 
@@ -97,6 +106,8 @@ class HostConfig:
     download_dir: Path = field(default_factory=lambda: Path.home() / "RemoteDesktop-收到的文件")
     max_viewers: int = 1  # 允许同时连接的会话总数(1 = 仅一个操作者,无额外观看者)
     allow_file_transfer: bool = True
+    share_dir: Path | None = None  # 显式共享给对方下载的目录;None = 关闭下载功能
+    show_cursor: bool = True
 
 
 class AuthRateLimiter:
@@ -138,30 +149,35 @@ def _extract_ip(ws) -> str:
 
 class Session:
     """一次 host<->client 连接的完整生命周期:握手、鉴权,以及后续的
-    画面推流 / 输入注入 / 剪贴板 / 文件接收 / 心跳收发。"""
+    画面推流 / 输入注入 / 剪贴板 / 光标 / 文件收发 / 心跳。"""
 
-    def __init__(self, ws, config: HostConfig, capture_executor: ThreadPoolExecutor,
-                 rate_limiter: AuthRateLimiter, peer_ip: str, can_control: bool):
+    def __init__(self, ws, config: HostConfig, hub: SharedCaptureHub,
+                 capture_executor: ThreadPoolExecutor, rate_limiter: AuthRateLimiter,
+                 resume_store: ResumeTokenStore, peer_ip: str, can_control: bool):
         self.ws = ws
         self.config = config
+        self.hub = hub
         self.capture_executor = capture_executor
         self.rate_limiter = rate_limiter
+        self.resume_store = resume_store
         self.peer_ip = peer_ip
         self.can_control = can_control
 
         self.cipher: crypto.SessionCipher | None = None
         self.adaptive = AdaptiveController()
-        self.capture = ScreenCapture(monitor_index=config.monitor_index)
         self.injector: InputInjector | None = None
         self.clipboard: ClipboardSync | None = None
         self.files: FileReceiver | None = None
+        self.share: ShareDirectory | None = None
         self.streamer: FrameStreamer | None = None
+        self.subscription = None
+        self.cursor = CursorCapture() if config.show_cursor else None
 
         self.send_queue = PrioritySendQueue()
         self._last_clipboard_apply_ts = 0.0
+        self._download_id = 0
         self._start_ts = time.monotonic()
         self._loop = asyncio.get_running_loop()
-        self._closed = False
 
     # ------------------------------------------------------------------
     # 基础工具
@@ -202,10 +218,17 @@ class Session:
         salt = crypto.new_salt()
         await self.ws.send(protocol.encode_kex_init(crypto.b64e(salt), crypto.PBKDF2_ITERATIONS))
 
-        session_key = crypto.derive_session_key(password=self.config.password, salt=salt)
-        self.cipher = crypto.SessionCipher(session_key, aad=salt)
-
         raw = await asyncio.wait_for(self.ws.recv(), timeout=HELLO_TIMEOUT_S)
+
+        # 客户端可以先发一条明文 resume 走"跳过 PBKDF2"的快速通道;
+        # 直接发二进制则是常规的密码通道。
+        if isinstance(raw, str):
+            raw = await self._try_resume(raw, salt)
+        else:
+            self.cipher = crypto.SessionCipher(
+                crypto.derive_session_key(password=self.config.password, salt=salt), aad=salt,
+            )
+
         if not isinstance(raw, (bytes, bytearray)):
             raise protocol.ProtocolError("expected binary encrypted hello")
         plaintext = self.cipher.decrypt(bytes(raw))  # 密码错误会在此直接抛出 CryptoError
@@ -213,10 +236,15 @@ class Session:
         if kind != protocol.MSG_CONTROL or msg.get("t") != T_HELLO:
             raise protocol.ProtocolError("expected hello message")
 
-        monitors = await self._loop.run_in_executor(self.capture_executor, self.capture.list_monitors)
+        codecs = msg.get("codecs")
+        if not isinstance(codecs, list):
+            codecs = list(protocol.DEFAULT_CODECS)
+        codecs = [c for c in codecs if isinstance(c, str) and c in protocol.CODEC_IDS]
+
+        monitors = await self._loop.run_in_executor(
+            self.capture_executor, self.hub.capture.list_monitors)
         width, height = await self._loop.run_in_executor(
-            self.capture_executor, lambda: self.capture.screen_size
-        )
+            self.capture_executor, lambda: self.hub.capture.screen_size)
 
         input_ok = False
         if self.can_control:
@@ -226,9 +254,10 @@ class Session:
             except InputUnavailableError as exc:
                 logger.warning("输入注入不可用(仅能观看画面,无法操作): %s", exc)
                 self.injector = None
-
-        if self.can_control and self.config.allow_file_transfer:
-            self.files = FileReceiver(self.config.download_dir)
+            if self.config.allow_file_transfer:
+                self.files = FileReceiver(self.config.download_dir)
+        if self.config.share_dir is not None:
+            self.share = ShareDirectory(self.config.share_dir)
 
         await self._send_control({
             "t": T_HELLO_ACK,
@@ -237,21 +266,57 @@ class Session:
             "input_available": input_ok,
             "can_control": self.can_control,
             "file_transfer": self.files is not None,
+            "share_available": self.share is not None,
+            "cursor": self.cursor is not None,
+            "codec": protocol.CODEC_NAMES[
+                protocol.FMT_WEBP if "webp" in codecs else protocol.FMT_JPEG],
             "monitors": [
                 {"index": m.index, "label": m.label, "width": m.width,
                  "height": m.height, "primary": m.is_primary}
                 for m in monitors
             ],
-            "current_monitor": self.capture.monitor_index,
+            "current_monitor": self.hub.capture.monitor_index,
+        })
+
+        # 下发一次性恢复令牌,让下次重连不必再跑 20 万次 PBKDF2
+        token_id, secret = self.resume_store.issue()
+        await self._send_control({
+            "t": T_RESUME_TOKEN, "id": token_id,
+            "secret": crypto.b64e(secret), "ttl": int(self.resume_store.ttl),
         })
 
         self.clipboard = ClipboardSync(on_local_change=self._on_local_clipboard_change)
         self.clipboard.start()
 
+        self.subscription = self.hub.subscribe()
         self.streamer = FrameStreamer(
-            capture=self.capture, tracker=DirtyTracker(), adaptive=self.adaptive,
+            subscription=self.subscription, capture=self.hub.capture, adaptive=self.adaptive,
             executor=self.capture_executor, send=self._send_plaintext, now_ms=self._now_ms,
+            codecs=codecs,
         )
+
+    async def _try_resume(self, text: str, salt: bytes):
+        """处理明文 resume 消息。成功则装配好 cipher 并返回随后的二进制 hello。"""
+        try:
+            msg = protocol.parse_kex_text(text)
+        except protocol.ProtocolError:
+            msg = {}
+        secret = None
+        if msg.get("t") == protocol.KEX_RESUME:
+            secret = self.resume_store.consume(msg.get("id"))
+
+        if secret is None:
+            # 令牌无效/过期:退回密码通道,让客户端重发一条加密 hello
+            logger.info("恢复令牌无效,来源 %s,退回密码认证", self.peer_ip)
+            self.cipher = crypto.SessionCipher(
+                crypto.derive_session_key(password=self.config.password, salt=salt), aad=salt,
+            )
+            await self.ws.send(json.dumps({"t": protocol.KEX_REJECT, "reason": "resume_failed"},
+                                          ensure_ascii=False))
+        else:
+            self.cipher = crypto.SessionCipher(derive_from_resume(secret, salt), aad=salt)
+            logger.info("使用恢复令牌快速重连,来源 %s(已跳过 PBKDF2)", self.peer_ip)
+        return await asyncio.wait_for(self.ws.recv(), timeout=HELLO_TIMEOUT_S)
 
     # ------------------------------------------------------------------
     # 剪贴板
@@ -319,6 +384,12 @@ class Session:
             if t == T_QUALITY_SET:
                 self._on_quality_set(msg)
                 return
+            if t == T_SHARE_LIST_REQ:
+                await self._on_share_list()
+                return
+            if t == T_SHARE_GET:
+                await self._on_share_get(msg)
+                return
             if t == T_BYE:
                 await self._safe_close()
                 return
@@ -372,6 +443,46 @@ class Session:
             logger.debug("忽略非法画质模式: %s", mode)
 
     # ------------------------------------------------------------------
+    # 光标
+    # ------------------------------------------------------------------
+
+    async def _cursor_loop(self) -> None:
+        """周期性采样光标并推送。
+
+        光标不画进画面帧:它是移动最频繁的元素,画进去会让所在区域每次都变成
+        脏矩形触发重传。单独发几十字节的控制消息便宜得多,客户端还能以本地
+        帧率平滑绘制。形状图像只在第一次出现时发一次,之后只发 id。
+        """
+        if self.cursor is None:
+            return
+        last_key = None
+        while True:
+            await asyncio.sleep(CURSOR_INTERVAL_S)
+            try:
+                snap = await self._loop.run_in_executor(self.capture_executor, self.cursor.sample)
+            except Exception:  # noqa: BLE001 - 光标是锦上添花,失败不影响主功能
+                continue
+            if snap is None:
+                continue
+            width, height = self.hub.capture.screen_size
+            if width <= 0 or height <= 0:
+                continue
+            key = (snap.x, snap.y, snap.shape_id)
+            if key == last_key and snap.png_b64 is None:
+                continue  # 位置和形状都没变,不用发
+            last_key = key
+            payload = {
+                "t": T_CURSOR,
+                "x": round(snap.x / width, 5), "y": round(snap.y / height, 5),
+            }
+            if snap.shape_id:
+                payload["sid"] = snap.shape_id
+            if snap.png_b64:
+                payload.update({"img": snap.png_b64, "w": snap.width, "h": snap.height,
+                                "hx": snap.hot_x, "hy": snap.hot_y})
+            await self._send_control(payload)
+
+    # ------------------------------------------------------------------
     # 显示器切换
     # ------------------------------------------------------------------
 
@@ -379,17 +490,16 @@ class Session:
         index = msg.get("index")
         if not isinstance(index, int):
             return
-        ok = await self._loop.run_in_executor(self.capture_executor, self.capture.set_monitor, index)
+        ok = await self.hub.set_monitor(index)
         if not ok:
             await self._send_control({"t": T_MONITOR_INFO, "ok": False, "reason": "显示器编号无效"})
             return
         width, height = await self._loop.run_in_executor(
-            self.capture_executor, lambda: self.capture.screen_size
-        )
+            self.capture_executor, lambda: self.hub.capture.screen_size)
         if self.injector:
             self.injector.update_screen_size(width, height)
         if self.streamer:
-            # 画面尺寸/内容整个换了,必须重置差分状态并强制发一个整帧
+            # 画面尺寸/内容整个换了,必须强制发一个整帧
             self.streamer.request_keyframe()
         await self._send_control({
             "t": T_MONITOR_INFO, "ok": True, "index": index, "width": width, "height": height,
@@ -397,7 +507,7 @@ class Session:
         logger.info("已切换到显示器 %d (%dx%d)", index, width, height)
 
     # ------------------------------------------------------------------
-    # 文件接收
+    # 文件接收(主控端 -> 被控端)
     # ------------------------------------------------------------------
 
     async def _on_file_begin(self, msg: dict) -> None:
@@ -449,6 +559,64 @@ class Session:
         await self._loop.run_in_executor(None, self.files.abort, msg.get("id"))
 
     # ------------------------------------------------------------------
+    # 文件下载(被控端 -> 主控端,需 --share-dir)
+    # ------------------------------------------------------------------
+
+    async def _on_share_list(self) -> None:
+        if self.share is None:
+            await self._send_control({"t": T_SHARE_LIST, "ok": False, "message": "被控端未开启文件共享"})
+            return
+        try:
+            files = await self._loop.run_in_executor(None, self.share.list_files)
+        except ShareError as exc:
+            await self._send_control({"t": T_SHARE_LIST, "ok": False, "message": str(exc)})
+            return
+        await self._send_control({"t": T_SHARE_LIST, "ok": True, "files": files})
+
+    async def _on_share_get(self, msg: dict) -> None:
+        if self.share is None:
+            await self._send_control({"t": T_FILE_ERROR, "id": 0, "message": "被控端未开启文件共享"})
+            return
+        name = msg.get("name")
+        try:
+            path = await self._loop.run_in_executor(None, self.share.resolve_file, name)
+            size = path.stat().st_size
+        except (ShareError, OSError) as exc:
+            await self._send_control({"t": T_FILE_ERROR, "id": 0, "message": str(exc)})
+            return
+
+        self._download_id += 1
+        transfer_id = self._download_id
+        await self._send_control({
+            "t": T_FILE_BEGIN, "id": transfer_id, "name": path.name, "size": size, "dir": "down",
+        })
+        logger.info("开始向主控端发送文件: %s (%d 字节)", path.name, size)
+        asyncio.create_task(self._stream_share_file(transfer_id, path))
+
+    async def _stream_share_file(self, transfer_id: int, path: Path) -> None:
+        """把文件按块加密后推给主控端。
+
+        分块走**最低优先级**队列并使用带背压的 put:文件传输再慢也不能把
+        画面和鼠标键盘挤掉——这与主控端上传方向的处理是同一个思路。
+        """
+        seq = 0
+        try:
+            while True:
+                data = await self._loop.run_in_executor(None, _read_chunk, path, seq)
+                if not data:
+                    break
+                payload = protocol.encode_file_chunk(transfer_id=transfer_id, seq=seq, data=data)
+                if self.cipher is None:
+                    return
+                await self.send_queue.put(self.cipher.encrypt(payload), PRIORITY_FILE)
+                seq += 1
+            await self._send_control({"t": T_FILE_END, "id": transfer_id})
+            logger.info("文件已发送完毕: %s", path.name)
+        except (OSError, ConnectionClosed) as exc:
+            logger.warning("发送文件中断: %s", exc)
+            await self._send_control({"t": T_FILE_ERROR, "id": transfer_id, "message": "发送中断"})
+
+    # ------------------------------------------------------------------
     # 统计上报
     # ------------------------------------------------------------------
 
@@ -464,9 +632,9 @@ class Session:
         """由 HostServer 在操作权移交给本会话时调用。"""
         self.can_control = True
         try:
-            width, height = self.capture.screen_size
+            width, height = self.hub.capture.screen_size
             self.injector = InputInjector(width, height)
-        except (InputUnavailableError, Exception):  # noqa: BLE001
+        except Exception:  # noqa: BLE001 - 无图形环境时降级为只能观看
             self.injector = None
         if self.config.allow_file_transfer and self.files is None:
             self.files = FileReceiver(self.config.download_dir)
@@ -509,32 +677,48 @@ class Session:
             asyncio.create_task(self.streamer.run(), name="frame"),
             asyncio.create_task(self._stats_loop(), name="stats"),
         ]
+        if self.cursor is not None:
+            tasks.append(asyncio.create_task(self._cursor_loop(), name="cursor"))
         try:
             await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
         finally:
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
+            if self.subscription is not None:
+                self.subscription.close()
             if self.clipboard:
                 self.clipboard.stop()
             if self.files:
                 self.files.cleanup_all()
-            # capture_executor 是单线程池,任务严格按提交顺序执行;取消推流
-            # 协程只是不再提交新的采集调用,并不能中断一次已经在执行中的调用。
-            # 这里提交一个空任务并等待它完成,借助"单线程 FIFO"的性质确保
-            # 上一次采集已经结束,再去关闭底层的 mss 实例,避免跨线程并发访问。
-            await self._loop.run_in_executor(self.capture_executor, lambda: None)
-            self.capture.close()
             await self._safe_close()
             logger.info("会话已结束,来源 %s", self.peer_ip)
+
+
+def _read_chunk(path: Path, seq: int) -> bytes:
+    """读取文件的第 seq 块(阻塞 I/O,由调用方放到线程池)。"""
+    with open(path, "rb") as f:
+        f.seek(seq * protocol.FILE_CHUNK_BYTES)
+        return f.read(protocol.FILE_CHUNK_BYTES)
 
 
 class HostServer:
     def __init__(self, config: HostConfig):
         self.config = config
         self.rate_limiter = AuthRateLimiter()
+        self.resume_store = ResumeTokenStore()
+        # 单线程池:mss 要求同一实例只在创建它的线程使用,单线程天然满足;
+        # 同时也让采集/编码任务串行化,避免多会话时把 CPU 打满。
         self.capture_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="capture")
         self._sessions: list[Session] = []
+        self._hub: SharedCaptureHub | None = None
+
+    def _get_hub(self) -> SharedCaptureHub:
+        """惰性创建共享采集管线(必须在事件循环里创建)。"""
+        if self._hub is None:
+            capture = ScreenCapture(monitor_index=self.config.monitor_index)
+            self._hub = SharedCaptureHub(capture, self.capture_executor)
+        return self._hub
 
     async def _reject(self, ws, reason: str) -> None:
         try:
@@ -565,7 +749,8 @@ class HostServer:
 
         # 当前没有任何会话持有操作权时,新会话即为操作者
         can_control = not any(s.can_control for s in self._sessions)
-        session = Session(ws, self.config, self.capture_executor, self.rate_limiter, peer_ip, can_control)
+        session = Session(ws, self.config, self._get_hub(), self.capture_executor,
+                          self.rate_limiter, self.resume_store, peer_ip, can_control)
         self._sessions.append(session)
         try:
             await session.run()

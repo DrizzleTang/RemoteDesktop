@@ -52,6 +52,8 @@ EWMA_ALPHA = 0.3
 UPGRADE_STREAK_REQUIRED = 5  # 连续多少次"良好"采样才允许升一档
 COOLDOWN_AFTER_TIMEOUT = 8  # 超时后,至少再等这么多次采样才允许升级
 DOWNGRADE_STREAK_FOR_EXTRA_DROP = 3  # 连续多少次都指向"更低两档以上"时额外多降一档
+SATURATION_RATIO = 0.75  # 当前吞吐达到近期峰值的这个比例即视为"带宽已打满"
+PEAK_DECAY = 0.97  # 吞吐峰值每次采样的衰减系数,让峰值估计能跟随网络变化
 
 
 def _latency_to_level(latency_ms: float) -> int:
@@ -75,6 +77,9 @@ class AdaptiveController:
     _low_target_streak: int = field(default=0, init=False)
     last_rtt_ms: float | None = field(default=None, init=False)
     consecutive_timeouts: int = field(default=0, init=False)
+    # 带宽观测:用于区分"链路本身就慢"和"带宽被自己打满"这两种延迟升高
+    _recent_kbps: float | None = field(default=None, init=False)
+    _peak_kbps: float | None = field(default=None, init=False)
 
     def set_mode(self, mode: str, *, custom_scale: float | None = None,
                  custom_jpeg_quality: int | None = None, custom_max_fps: float | None = None) -> None:
@@ -108,7 +113,13 @@ class AdaptiveController:
             else:
                 self._low_target_streak = 0
             drop_extra = 1 if self._low_target_streak >= DOWNGRADE_STREAK_FOR_EXTRA_DROP else 0
-            self._level_idx = max(0, target - drop_extra)
+            new_idx = max(0, target - drop_extra)
+            if self.is_bandwidth_saturated() is False:
+                # 带宽还很充裕,延迟高是链路本身的问题(跨国/卫星/移动网络)。
+                # 这种情况下狂降画质对延迟毫无帮助,只会让画面白白变糊,
+                # 因此每次最多降一档,慢慢试探。
+                new_idx = max(new_idx, self._level_idx - 1)
+            self._level_idx = new_idx
             self._upgrade_streak = 0
             self._cooldown = max(self._cooldown, 2)
         elif target > self._level_idx:
@@ -137,6 +148,33 @@ class AdaptiveController:
         self._upgrade_streak = 0
         self._low_target_streak = 0
         self._cooldown = COOLDOWN_AFTER_TIMEOUT
+
+    def on_throughput_sample(self, kbps: float) -> None:
+        """记录一次实际吞吐观测(由推流器每秒上报一次)。
+
+        为什么需要这个:只看延迟无法区分两种截然不同的情况——
+        (a) **带宽被打满**:我们自己发得太多,数据在链路缓冲里排队,延迟升高。
+            此时降低画质能直接减少字节数,延迟会立刻改善。
+        (b) **链路本身延迟高**(跨国、卫星、移动网络),但带宽其实很充裕。
+            此时降低画质对延迟几乎没有帮助,只是白白牺牲清晰度。
+        判据是把当前吞吐和"近期观测到的吞吐峰值"比较:接近峰值说明已经
+        撑满了链路(情况 a),远低于峰值说明瓶颈不在带宽(情况 b)。
+        """
+        if kbps <= 0:
+            return
+        self._recent_kbps = kbps
+        if self._peak_kbps is None:
+            self._peak_kbps = kbps
+        else:
+            # 峰值缓慢衰减,避免历史上某次突发把峰值永久抬高,导致之后
+            # 永远判定为"未饱和"
+            self._peak_kbps = max(kbps, self._peak_kbps * PEAK_DECAY)
+
+    def is_bandwidth_saturated(self) -> bool | None:
+        """True=带宽已打满,False=链路本身慢,None=数据不足无法判断。"""
+        if self._recent_kbps is None or self._peak_kbps is None or self._peak_kbps <= 0:
+            return None
+        return (self._recent_kbps / self._peak_kbps) >= SATURATION_RATIO
 
     def on_ping_rtt(self, rtt_ms: float) -> None:
         """独立心跳 RTT,仅用于展示与统计,不直接驱动调档(避免与 frame_ack 信号叠加振荡)。"""
@@ -172,8 +210,11 @@ class AdaptiveController:
 
     def stats_snapshot(self) -> dict:
         params = self.current_params()
+        saturated = self.is_bandwidth_saturated()
         params.update({
             "ewma_ack_latency_ms": round(self._ewma_latency_ms, 1) if self._ewma_latency_ms else None,
             "rtt_ms": round(self.last_rtt_ms, 1) if self.last_rtt_ms is not None else None,
+            "peak_kbps": round(self._peak_kbps, 1) if self._peak_kbps is not None else None,
+            "bw_saturated": saturated,
         })
         return params

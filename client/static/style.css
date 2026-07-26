@@ -434,3 +434,80 @@ html, body {
   .transfer-row { grid-template-columns: minmax(0, 1fr) 80px; }
   .transfer-row .transfer-meta { display: none; }
 }
+
+/* ---------- 远端鼠标光标叠加层 ----------
+   截屏本身不含指针,光标由被控端单独采集后叠加在这里。位置用百分比表达,
+   画面被 CSS 缩放显示时依然对得上。 */
+#remote-cursor {
+  position: absolute;
+  display: none;
+  pointer-events: none;
+  z-index: 5;
+  background-repeat: no-repeat;
+  background-size: contain;
+  image-rendering: pixelated;
+}
+
+/* ---------- 远端共享文件面板 ---------- */
+#remote-files-panel {
+  position: absolute;
+  right: 16px;
+  top: 60px;
+  width: 320px;
+  max-height: 60vh;
+  overflow-y: auto;
+  background: var(--panel);
+  border: 1px solid var(--panel-border);
+  border-radius: 10px;
+  padding: 10px 12px;
+  z-index: 40;
+  font-size: 13px;
+}
+
+.remote-files-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  color: var(--text-dim);
+  font-size: 12px;
+  margin-bottom: 8px;
+}
+
+.remote-files-head button {
+  padding: 3px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--panel-border);
+  background: #12151b;
+  color: var(--text);
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.remote-file-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+  padding: 5px 0;
+  border-top: 1px solid var(--panel-border);
+}
+
+.remote-file-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.remote-file-size { color: var(--text-dim); font-size: 12px; white-space: nowrap; }
+
+.remote-file-row button {
+  padding: 3px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--panel-border);
+  background: #12151b;
+  color: var(--accent);
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.remote-files-empty { color: var(--text-dim); padding: 8px 0; }

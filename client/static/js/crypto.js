@@ -16,6 +16,7 @@
  */
 
 const HKDF_INFO = 'remotedesktop-session-key-v1';
+const RESUME_INFO = 'remotedesktop-resume-key-v1';
 const REPLAY_WINDOW = 20000; // 会话内记住的最近 nonce 数量上限
 
 // 对未鉴权的 kex_init 参数做范围校验,防止中间人把 KDF 强度改弱,
@@ -75,6 +76,22 @@ export class SessionCipher {
     this.saltBytes = saltBytes; // 同时作为 AES-GCM 的附加认证数据(AAD)
     this._seenNonces = new Set();
     this._nonceOrder = [];
+  }
+
+  /**
+   * 用上次会话下发的恢复令牌 secret 直接派生会话密钥,跳过 PBKDF2。
+   * 与 Python 侧 host/resume.py 的 derive_from_resume 对应:HKDF(secret, salt, info)。
+   * 每次重连都用新的 salt,所以即使同一 secret 被重复使用,两次会话密钥也不同。
+   */
+  static async fromResumeSecret(secretB64, saltBytes) {
+    const enc = new TextEncoder();
+    const secret = base64ToBytes(secretB64);
+    const material = await crypto.subtle.importKey('raw', secret, 'HKDF', false, ['deriveKey']);
+    const aesKey = await crypto.subtle.deriveKey(
+      { name: 'HKDF', hash: 'SHA-256', salt: saltBytes, info: enc.encode(RESUME_INFO) },
+      material, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt'],
+    );
+    return new SessionCipher(aesKey, saltBytes);
   }
 
   static async derive(password, saltBytes, iterations) {

@@ -85,7 +85,10 @@ export class UI {
     }
     this.statsText.textContent = parts.join(' · ');
     this.statsText.title = msg.rects !== undefined
-      ? `本帧变化区域 ${msg.rects} 块 · 关键帧 ${msg.keyframes} · 增量帧 ${msg.deltas} · 静止跳过 ${msg.skipped}`
+      ? `编码 ${msg.codec || '?'} · 本帧变化区域 ${msg.rects} 块 · 关键帧 ${msg.keyframes}`
+        + ` · 增量帧 ${msg.deltas} · 静止跳过 ${msg.skipped}`
+        + (msg.bw_saturated === true ? ' · 带宽已打满'
+           : msg.bw_saturated === false ? ' · 带宽充裕(延迟来自链路本身)' : '')
       : '';
   }
 

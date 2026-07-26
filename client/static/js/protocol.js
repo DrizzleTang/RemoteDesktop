@@ -28,6 +28,10 @@ export const FRAME_HEADER_BYTES = 16;
 export const RECT_HEADER_BYTES = 12;
 export const FILE_CHUNK_HEADER_BYTES = 8;
 
+export const FMT_JPEG = 0;
+export const FMT_WEBP = 1;
+export const MIME_BY_FMT = { 0: 'image/jpeg', 1: 'image/webp' };
+
 export const MAX_FRAME_DIMENSION = 8192; // 防止被篡改的宽高把 canvas/内存撑爆
 export const MAX_RECTS_PER_FRAME = 512;
 export const FILE_CHUNK_BYTES = 64 * 1024;
@@ -95,4 +99,35 @@ export function encodeFileChunk(transferId, seq, data) {
   dv.setUint32(5, seq >>> 0);
   out.set(data, 1 + FILE_CHUNK_HEADER_BYTES);
   return out;
+}
+
+/** 解析文件分块(被控端 -> 主控端方向的下载)。 */
+export function decodeFileChunk(body) {
+  if (body.length < FILE_CHUNK_HEADER_BYTES) throw new ProtocolError('文件分块头部被截断');
+  const dv = new DataView(body.buffer, body.byteOffset, body.byteLength);
+  return {
+    transferId: dv.getUint32(0),
+    seq: dv.getUint32(4),
+    data: body.subarray(FILE_CHUNK_HEADER_BYTES),
+  };
+}
+
+/**
+ * 探测浏览器能解码哪些格式,用于在 hello 里向被控端声明能力。
+ * WebP 在增量帧的小矩形上比 JPEG 省 80% 以上,但 Safari 14 以下不支持,
+ * 必须能优雅回落到 JPEG。
+ */
+export async function detectCodecs() {
+  const codecs = ['jpeg'];
+  try {
+    // 1x1 的合法 WebP;能成功解码才说明真的支持
+    const bytes = Uint8Array.from(atob(
+      'UklGRhoAAABXRUJQVlA4TA0AAAAvAAAAEAcQERGIiP4HAA=='), (c) => c.charCodeAt(0));
+    const bitmap = await createImageBitmap(new Blob([bytes], { type: 'image/webp' }));
+    bitmap.close();
+    codecs.unshift('webp');
+  } catch {
+    // 不支持 WebP,保持只声明 jpeg
+  }
+  return codecs;
 }

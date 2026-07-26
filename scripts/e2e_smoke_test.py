@@ -26,8 +26,13 @@ import tempfile
 import time
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# 直接以脚本方式运行时,sys.path[0] 是 scripts/ 而不是仓库根目录,
+# 这里补上根目录,才能 import 到仓库里的模块。
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
 DISPLAY = ":99"
 HOST_PORT = 18765
+PROXY_PORT = 18767  # 客户端经由这个可切断的代理连接 host,用于模拟网络中断
 HOST2_PORT = 18766
 CLIENT_PORT = 18081
 PASSWORD = "e2epass123"
@@ -93,9 +98,14 @@ def main() -> int:
     env["PYTHONPATH"] = REPO_ROOT
 
     procs: list[subprocess.Popen] = []
+    proxy = None
     tmpdir = tempfile.mkdtemp(prefix="rd-e2e-")
     key_log = os.path.join(tmpdir, "keys.log")
     download_dir = os.path.join(tmpdir, "downloads")
+    share_dir = os.path.join(tmpdir, "shared")
+    os.makedirs(share_dir, exist_ok=True)
+    with open(os.path.join(share_dir, "共享文档.txt"), "w", encoding="utf-8") as f:
+        f.write("这是被控端共享的文件内容\n" * 200)
     host_log = open(os.path.join(tmpdir, "host.log"), "w")
     open(key_log, "w").close()
 
@@ -108,7 +118,8 @@ def main() -> int:
         return spawn(
             [sys.executable, "-m", "host.main", "--port", str(port),
              "--bind-host", "127.0.0.1", "--password", PASSWORD, "--log-level", "DEBUG",
-             "--download-dir", download_dir, "--no-tray"] + (extra or []),
+             "--download-dir", download_dir, "--share-dir", share_dir,
+             "--no-tray"] + (extra or []),
             env=env, stdout=host_log, stderr=subprocess.STDOUT,
         )
 
@@ -126,6 +137,11 @@ def main() -> int:
 
         host_proc = spawn_host(HOST_PORT)
         check("host 进程监听端口", wait_for_port(HOST_PORT))
+
+        from scripts.tcp_proxy import KillableProxy
+        proxy = KillableProxy(PROXY_PORT, HOST_PORT)
+        proxy.start()
+        check("可切断代理已就绪", wait_for_port(PROXY_PORT))
 
         spawn([sys.executable, "-m", "client.main", "--port", str(CLIENT_PORT), "--no-browser"],
               env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -149,7 +165,7 @@ def main() -> int:
             page.on("pageerror", lambda e: console_errors.append(str(e)))
             page.goto(f"http://127.0.0.1:{CLIENT_PORT}/")
 
-            page.fill("#field-address", f"127.0.0.1:{HOST_PORT}")
+            page.fill("#field-address", f"127.0.0.1:{PROXY_PORT}")
             page.fill("#field-password", PASSWORD)
             page.click("#connect-btn")
 
@@ -216,6 +232,22 @@ def main() -> int:
                   f"不同颜色数={canvas_has_content()}")
             flicker.terminate()
             time.sleep(0.5)
+
+            # ---------------- 编码格式协商 ----------------
+            codec = page.evaluate("""() => {
+                const t = document.getElementById('stats-text').textContent || '';
+                return t;
+            }""")
+            check("增量帧使用 WebP 编码(比 JPEG 省 80% 以上流量)",
+                  wait_until(lambda: "webp" in (stats_title(page) or "").lower()
+                             or "webp" in (page.text_content("#stats-text") or "").lower(),
+                             timeout=10),
+                  f"stats={page.text_content('#stats-text')!r} title={stats_title(page)!r}")
+
+            # ---------------- 远端鼠标光标 ----------------
+            # 截屏本身不含指针,光标由被控端单独采集后叠加绘制
+            check("远端鼠标光标已显示",
+                  wait_until(lambda: page.is_visible("#remote-cursor"), timeout=10))
 
             # ---------------- 鼠标 / 键盘 ----------------
             canvas = page.locator("#screen")
@@ -308,6 +340,48 @@ def main() -> int:
                 check("传输进度界面已显示",
                       page.is_visible("#transfer-panel"))
 
+            # ---------------- 从被控端下载文件 ----------------
+            check("远端文件按钮已出现(被控端开启了共享目录)",
+                  page.is_visible("#btn-remote-files"))
+            page.click("#btn-remote-files")
+            check("共享文件列表已加载",
+                  wait_until(lambda: "共享文档.txt" in (page.text_content("#remote-files-list") or ""),
+                             timeout=8),
+                  f"list={page.text_content('#remote-files-list')!r}")
+
+            with page.expect_download(timeout=20000) as dl_info:
+                page.click("#remote-files-list button")
+            download = dl_info.value
+            downloaded_path = os.path.join(tmpdir, "downloaded.txt")
+            download.save_as(downloaded_path)
+            with open(downloaded_path, encoding="utf-8") as f:
+                got = f.read()
+            with open(os.path.join(share_dir, "共享文档.txt"), encoding="utf-8") as f:
+                want = f.read()
+            check("从被控端下载的文件内容完全一致", got == want,
+                  f"下载 {len(got)} 字节 vs 原文件 {len(want)} 字节")
+            page.click("#btn-remote-files-close")
+
+            # ---------------- 网络抖动 -> 恢复令牌快速重连 ----------------
+            # 注意这里必须让 host 进程**存活**,只切断网络:恢复令牌保存在
+            # host 进程内存里,进程重启后旧令牌自然失效(会正确回退到密码认证)。
+            # 弱网下真正高频发生的是网络抖动,而不是对方重启程序。
+            dropped = proxy.drop_all()
+            check("已切断网络连接(被控端进程保持存活)", dropped > 0, f"切断了 {dropped} 个套接字")
+            check("断网后进入重连状态",
+                  wait_until(lambda: "重连" in (page.text_content("#status-text") or ""), timeout=10),
+                  f"status={page.text_content('#status-text')!r}")
+            check("网络恢复后自动重连成功",
+                  wait_until(lambda: "已连接" in (page.text_content("#status-text") or ""), timeout=25),
+                  f"status={page.text_content('#status-text')!r}")
+
+            host_log.flush()
+            with open(host_log.name, encoding="utf-8", errors="replace") as f:
+                log_text = f.read()
+            check("网络抖动重连走了恢复令牌快速通道(跳过 PBKDF2)",
+                  "已跳过 PBKDF2" in log_text,
+                  "host 日志中未见恢复令牌快速重连记录")
+
             # ---------------- 断线遮罩 + 自动重连 ----------------
             host_proc.terminate()
             check("host 断开后 client 能感知并进入重连状态",
@@ -323,6 +397,13 @@ def main() -> int:
                   f"status={page.text_content('#status-text')!r}")
             check("重连成功后遮罩自动消失",
                   wait_until(lambda: not page.is_visible("#screen-overlay"), timeout=8))
+
+            host_log.flush()
+            with open(host_log.name, encoding="utf-8", errors="replace") as f:
+                log_text = f.read()
+            check("host 重启后旧令牌失效并正确回退到密码认证",
+                  "恢复令牌无效" in log_text,
+                  "未见令牌失效回退记录")
 
             page.close()
 
@@ -362,6 +443,10 @@ def main() -> int:
             browser.close()
 
     finally:
+        try:
+            proxy.stop()
+        except Exception:  # noqa: BLE001
+            pass
         for p in procs:
             try:
                 p.send_signal(signal.SIGTERM)

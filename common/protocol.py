@@ -39,13 +39,17 @@ import struct
 from dataclasses import dataclass
 from typing import Any
 
-PROTOCOL_VERSION = 2
+PROTOCOL_VERSION = 3
 
 # ---- 明文握手阶段消息类型(仅用于 kex 之前,走 WebSocket 文本帧)----
 # 握手只有 host -> client 单向的 kex_init(内含 salt + KDF 参数);client 收到后
 # 直接本地派生密钥,无需再回复握手消息,详见 common/crypto.py 顶部说明。
 KEX_INIT = "kex_init"
-KEX_REJECT = "kex_reject"  # relay/host 侧在无法配对或版本不兼容/繁忙时明文告知原因
+KEX_REJECT = "kex_reject"
+# 重连时客户端可以先发一条明文 resume(只含公开的 token_id),双方直接用
+# 上次会话下发的 secret 派生密钥,跳过昂贵的 PBKDF2。host 收到 kex_init
+# 之后的第一条消息若是文本 resume 就走这条路径,是二进制就走密码路径。
+KEX_RESUME = "resume"  # relay/host 侧在无法配对或版本不兼容/繁忙时明文告知原因
 
 # ---- 加密后二进制帧的一级分类 ----
 MSG_CONTROL = 0x01
@@ -73,6 +77,15 @@ T_MONITOR_SET = "monitor_set"
 T_MONITOR_INFO = "monitor_info"
 # 观看者身份变化(多人观看时:谁持有操作权)
 T_VIEWER_INFO = "viewer_info"
+# 远端鼠标光标(位置 + 形状)。光标单独走控制消息,不混进画面帧——
+# 这样光标移动不必触发画面区域重传,反而更省带宽。
+T_CURSOR = "cursor"
+# 重连恢复令牌:握手成功后由 host 下发,重连时用它跳过昂贵的 PBKDF2
+T_RESUME_TOKEN = "resume_token"
+# 被控端 -> 主控端的文件下载(仅当 host 启用了 --share-dir)
+T_SHARE_LIST_REQ = "share_list_req"
+T_SHARE_LIST = "share_list"
+T_SHARE_GET = "share_get"
 # 文件传输(client -> host 上传)
 T_FILE_BEGIN = "file_begin"
 T_FILE_END = "file_end"
@@ -92,6 +105,13 @@ FILE_CHUNK_HEADER_STRUCT = struct.Struct(">II")  # transfer_id, seq
 FRAME_MAGIC = 0xF1
 FMT_JPEG = 0
 FMT_WEBP = 1
+# 客户端在 hello 里声明自己能解码哪些格式,host 据此选择编码格式。
+# WebP 在增量帧的小矩形上比 JPEG 省 80% 以上(JPEG 每张图有约 600 字节的
+# 固定头部,小图上头部比数据还大),但整屏编码耗时明显更高,因此关键帧要
+# 按"瓶颈在网络还是在 CPU"动态选择。Safari 14 以下不支持 WebP,必须回落。
+CODEC_NAMES = {FMT_JPEG: "jpeg", FMT_WEBP: "webp"}
+CODEC_IDS = {name: fmt for fmt, name in CODEC_NAMES.items()}
+DEFAULT_CODECS = ("jpeg",)
 FLAG_KEYFRAME = 0b0000_0001
 
 MAX_CONTROL_MESSAGE_BYTES = 64 * 1024  # 控制消息(JSON)上限,防止异常输入拖垮解析
