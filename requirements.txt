@@ -1,0 +1,13 @@
+# 核心依赖(host / client / relay 通用)
+websockets>=13.0
+Pillow>=10.0
+cryptography>=42.0
+
+# 被控端(host)专用:屏幕采集、输入注入、剪贴板
+mss>=9.0
+pynput>=1.7
+pyperclip>=1.8
+
+# Windows 打包(可选,仅打包时需要)
+pyinstaller>=6.0; sys_platform == "win32"
+pystray>=0.19; sys_platform == "win32"

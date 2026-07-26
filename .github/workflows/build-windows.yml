@@ -1,0 +1,165 @@
+name: build-windows
+
+# 在真实的 windows-latest runner 上编译出 Windows PE 格式的 exe。
+# 本地 Linux 沙箱无法交叉编译出可用的 Windows 可执行文件,所以这一步必须放在 CI 里做。
+on:
+  push:
+    branches:
+      - '**'
+    tags:
+      - 'v*'
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 安装项目依赖 + 打包工具
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller pystray
+
+      - name: 打包 被控端 RemoteDesktop-Host.exe (保留控制台窗口)
+        shell: pwsh
+        run: |
+          if (Test-Path "build/RemoteDesktop-Host.spec") {
+            pyinstaller --distpath dist --workpath pybuild --noconfirm build/RemoteDesktop-Host.spec
+          } else {
+            pyinstaller --onefile --console --name RemoteDesktop-Host `
+              --distpath dist --workpath pybuild --noconfirm `
+              host/main.py
+          }
+
+      - name: 打包 主控端 RemoteDesktop-Client.exe (无控制台窗口 + 内置静态资源)
+        shell: pwsh
+        run: |
+          if (Test-Path "build/RemoteDesktop-Client.spec") {
+            pyinstaller --distpath dist --workpath pybuild --noconfirm build/RemoteDesktop-Client.spec
+          } else {
+            pyinstaller --onefile --windowed --name RemoteDesktop-Client `
+              --distpath dist --workpath pybuild --noconfirm `
+              --add-data "client/static;client/static" `
+              client/main.py
+          }
+
+      - name: 校验产物是否存在
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "dist/RemoteDesktop-Host.exe")) {
+            throw "dist/RemoteDesktop-Host.exe 未生成,打包失败"
+          }
+          if (-not (Test-Path "dist/RemoteDesktop-Client.exe")) {
+            throw "dist/RemoteDesktop-Client.exe 未生成,打包失败"
+          }
+          Get-ChildItem dist
+
+      - name: 生成使用说明.txt
+        shell: pwsh
+        run: |
+          $note = @"
+          远程桌面助手 - 使用说明
+          ========================================
+
+          一、被控端(需要被远程控制的电脑)
+             双击运行 RemoteDesktop-Host.exe
+             程序启动后会弹出控制台窗口,并在其中显示"连接ID"和"连接密码",
+             请将这两项信息告知使用主控端的一方。
+             请保持该控制台窗口开启,关闭窗口将断开远程连接。
+
+          二、主控端(用来控制对方电脑的一方)
+             双击运行 RemoteDesktop-Client.exe
+             程序会自动在本机启动一个网页服务,并用默认浏览器打开控制界面。
+             在打开的网页中填入被控端提供的"连接ID"和"连接密码",
+             点击连接即可开始远程控制。
+
+          三、常见问题
+             1. 双击后没有反应、或被拦截:请在 Windows Defender / 杀毒软件的
+                提示中选择"仍要运行",或将 exe 加入信任名单后重试。
+             2. 无法连接:请确认被控端和主控端所在网络都能访问中转服务器,
+                并确认"连接ID"和"连接密码"输入无误。
+          "@
+          Set-Content -Path "dist/使用说明.txt" -Value $note -Encoding UTF8
+
+      - name: 安装 Inno Setup
+        shell: pwsh
+        continue-on-error: true
+        run: choco install innosetup -y --no-progress
+
+      - name: 编译一键安装包 RemoteDesktopSetup.exe
+        id: build_installer
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $iscc = Get-Command "ISCC.exe" -ErrorAction SilentlyContinue
+          if (-not $iscc) {
+            $candidates = @(
+              "C:\Program Files (x86)\Inno Setup 6\ISCC.exe",
+              "C:\Program Files\Inno Setup 6\ISCC.exe"
+            )
+            foreach ($c in $candidates) {
+              if (Test-Path $c) { $iscc = $c; break }
+            }
+          } else {
+            $iscc = $iscc.Source
+          }
+          if (-not $iscc) {
+            throw "未找到 ISCC.exe,跳过安装包编译(不影响两个 exe 主产物)"
+          }
+          Write-Host "使用 ISCC: $iscc"
+          & $iscc "build\installer.iss"
+
+      - name: 生成绿色免安装压缩包 RemoteDesktop-Windows-Portable.zip
+        shell: pwsh
+        run: |
+          $stage = "dist/RemoteDesktop-Windows-Portable"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item "dist/RemoteDesktop-Host.exe" $stage
+          Copy-Item "dist/RemoteDesktop-Client.exe" $stage
+          Copy-Item "dist/使用说明.txt" $stage
+          Compress-Archive -Path "$stage/*" -DestinationPath "dist/RemoteDesktop-Windows-Portable.zip" -Force
+
+      - name: 汇总构建产物到 artifacts 目录
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path "artifacts" | Out-Null
+          Copy-Item "dist/RemoteDesktop-Host.exe" "artifacts/"
+          Copy-Item "dist/RemoteDesktop-Client.exe" "artifacts/"
+          Copy-Item "dist/RemoteDesktop-Windows-Portable.zip" "artifacts/"
+          $setup = "build/Output/RemoteDesktopSetup.exe"
+          if (Test-Path $setup) {
+            Copy-Item $setup "artifacts/"
+            Write-Host "RemoteDesktopSetup.exe 已生成并加入产物"
+          } else {
+            Write-Host "RemoteDesktopSetup.exe 未生成(Inno Setup 步骤可能失败或被跳过),仅提供绿色版 zip 和 exe"
+          }
+          Get-ChildItem artifacts
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: remotedesktop-windows
+          path: artifacts/*
+          if-no-files-found: error
+
+      - name: 创建 GitHub Release (仅当推送了 v* 标签时)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

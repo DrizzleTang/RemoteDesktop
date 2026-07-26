@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<title>远程桌面 - 主控端</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<div id="connect-screen" class="screen">
+  <div class="connect-card">
+    <h1>远程桌面 主控端</h1>
+    <p class="subtitle">自研远程桌面客户端 &middot; 专为弱网 / 高延迟环境优化</p>
+
+    <div class="tabs">
+      <button type="button" class="tab-btn active" data-mode="direct">直连</button>
+      <button type="button" class="tab-btn" data-mode="relay">中转(穿透 NAT)</button>
+    </div>
+
+    <form id="connect-form">
+      <div id="direct-fields" class="field-group">
+        <label>被控端地址(IP:端口)
+          <input type="text" id="field-address" placeholder="例如 192.168.1.5:8765" autocomplete="off">
+        </label>
+      </div>
+
+      <div id="relay-fields" class="field-group" style="display:none">
+        <label>中转服务器地址
+          <input type="text" id="field-relay-address" placeholder="例如 relay.example.com:8770" autocomplete="off">
+        </label>
+        <label>会话码(ID)
+          <input type="text" id="field-relay-id" placeholder="被控端启动时显示的会话码" autocomplete="off">
+        </label>
+      </div>
+
+      <label>访问密码
+        <input type="password" id="field-password" placeholder="被控端启动时显示的密码" autocomplete="off">
+      </label>
+
+      <button type="submit" id="connect-btn" class="primary-btn">连接</button>
+      <div id="connect-status" class="connect-status"></div>
+    </form>
+  </div>
+</div>
+
+<div id="session-screen" class="screen" style="display:none">
+  <div id="toolbar">
+    <div class="toolbar-group">
+      <span id="status-dot" class="status-dot"></span>
+      <span id="status-text">未连接</span>
+      <span id="latency-badge" class="badge">-- ms</span>
+    </div>
+
+    <div class="toolbar-group">
+      <label class="quality-label">清晰度
+        <select id="quality-select">
+          <option value="auto" selected>智能(自动)</option>
+          <option value="extreme">极速</option>
+          <option value="smooth">流畅</option>
+          <option value="balanced">均衡</option>
+          <option value="clear">清晰</option>
+          <option value="hd">高清</option>
+          <option value="custom">自定义</option>
+        </select>
+      </label>
+      <span id="stats-text" class="stats-text"></span>
+    </div>
+
+    <div class="toolbar-group">
+      <button type="button" id="btn-send-clipboard" title="把本机剪贴板发送到对方">发送剪贴板</button>
+      <button type="button" id="btn-fullscreen" title="全屏">全屏</button>
+      <button type="button" id="btn-disconnect" class="danger-btn">断开连接</button>
+    </div>
+  </div>
+
+  <div id="custom-quality-panel" style="display:none">
+    <label>分辨率缩放 <input type="range" id="range-scale" min="0.2" max="1" step="0.05" value="0.75"> <span id="range-scale-val">75%</span></label>
+    <label>JPEG 质量 <input type="range" id="range-jpeg" min="10" max="95" step="5" value="60"> <span id="range-jpeg-val">60</span></label>
+    <label>最大帧率 <input type="range" id="range-fps" min="1" max="30" step="1" value="20"> <span id="range-fps-val">20</span></label>
+  </div>
+
+  <div id="canvas-wrap">
+    <canvas id="screen" tabindex="0"></canvas>
+    <div id="canvas-hint">点击画面开始操作(鼠标 / 键盘将被转发到对方电脑)</div>
+  </div>
+</div>
+
+<div id="toast" class="toast" style="display:none"></div>
+<div id="clipboard-fallback" class="clipboard-fallback" style="display:none">
+  <div class="clipboard-fallback-title">收到对方剪贴板内容(浏览器阻止了自动写入):</div>
+  <textarea id="clipboard-fallback-text" readonly></textarea>
+  <div class="clipboard-fallback-actions">
+    <button type="button" id="clipboard-fallback-copy">复制</button>
+    <button type="button" id="clipboard-fallback-close">关闭</button>
+  </div>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>
