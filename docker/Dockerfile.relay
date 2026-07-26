@@ -1,0 +1,66 @@
+# syntax=docker/dockerfile:1
+#
+# RemoteDesktop 中转服务器(relay)镜像。
+#
+# 构建命令(注意:构建上下文必须是**仓库根目录**,因为下面要 COPY relay/):
+#   docker build -f docker/Dockerfile.relay -t remotedesktop-relay:latest .
+#
+# 运行命令:
+#   docker run -d --name relay -p 8770:8770 --restart unless-stopped remotedesktop-relay:latest
+
+FROM python:3.11-slim
+
+# --- 依赖 -------------------------------------------------------------------
+# 这里**故意不用** `pip install -r requirements.txt`。
+# requirements.txt 是整个项目共用的清单,里面的 mss / pynput / pyperclip / Pillow
+# 全是**被控端(host)专用**的依赖:屏幕采集、输入注入、剪贴板、图像编码。
+# relay 只做一件事——把 WebSocket 消息从一端原样转发到另一端,relay/ 下的代码
+# 只 import 了 websockets 和 Python 标准库,一行都用不到那些包。
+# 把它们装进 relay 镜像的坏处是实打实的:
+#   1) 镜像体积大出一大截(Pillow / numpy 会拖进一堆本地编译库);
+#   2) pynput / mss 依赖 X11 相关的系统库,等于往一台直接暴露在公网的服务器上
+#      平白增加攻击面;
+#   3) 每次构建都要多花几十秒。
+# 所以只装 websockets 一个包。版本下限与 requirements.txt 保持一致。
+RUN pip install --no-cache-dir "websockets>=13.0"
+
+WORKDIR /app
+
+# --- 源码 -------------------------------------------------------------------
+# 只需要 relay/ 一个目录。
+# 已确认 relay/ 下的代码**不 import common/**(relay 不解析任何应用层报文,
+# 自然用不到 common/protocol.py、common/crypto.py),host/ 与 client/ 更是完全
+# 无关,所以都不 COPY,保持镜像最小。
+COPY relay/ /app/relay/
+# 容器健康检查脚本(见文件内注释:同时兼容明文 http 与 TLS https 两种模式)
+COPY docker/healthcheck.py /app/healthcheck.py
+
+# --- 非 root 用户 ------------------------------------------------------------
+# relay 是直接挂在公网上的服务,必须以非 root 身份运行:万一被攻破,攻击者拿到
+# 的也只是一个没有登录 shell、对 /app 只读的普通用户。
+RUN useradd --system --create-home --shell /usr/sbin/nologin relay \
+    && chown -R relay:relay /app
+USER relay
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONPATH=/app \
+    RELAY_PORT=8770
+
+EXPOSE 8770
+
+# --- 健康检查 ---------------------------------------------------------------
+# 调用 relay 的 /healthz 端点(该端点只返回聚合计数,不含会话码/IP 等敏感信息)。
+# start-period 给进程留出启动时间,期间探测失败不计入 retries。
+HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
+    CMD ["python", "/app/healthcheck.py"]
+
+# --- 启动 -------------------------------------------------------------------
+# 用 exec 形式(JSON 数组),这样 python 进程就是容器里的 PID 1,能直接收到
+# `docker stop` 发来的 SIGTERM,走 relay/main.py 里注册的优雅退出逻辑。
+#
+# 要启用 TLS(wss://),不要改这里,而是在 `docker run` / compose 里覆盖 command,
+# 例如(证书通过 volume 挂进容器):
+#   command: ["python","-m","relay.main","--host","0.0.0.0","--port","8770",
+#             "--cert","/certs/fullchain.pem","--key","/certs/privkey.pem"]
+CMD ["python", "-m", "relay.main", "--host", "0.0.0.0", "--port", "8770"]

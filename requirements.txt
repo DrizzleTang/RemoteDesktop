@@ -1,13 +1,17 @@
 # 核心依赖(host / client / relay 通用)
 websockets>=13.0
-Pillow>=10.0
 cryptography>=42.0
 
-# 被控端(host)专用:屏幕采集、输入注入、剪贴板
+# 被控端(host)专用:屏幕采集、图像编码、输入注入、剪贴板
+# numpy 用于像素格式转换与逐块差分检测(增量编码),是弱网省带宽的关键路径
 mss>=9.0
+numpy>=1.24
+Pillow>=10.0
 pynput>=1.7
 pyperclip>=1.8
 
+# 系统托盘图标(可选;不可用时被控端会自动降级为纯控制台运行)
+pystray>=0.19
+
 # Windows 打包(可选,仅打包时需要)
 pyinstaller>=6.0; sys_platform == "win32"
-pystray>=0.19; sys_platform == "win32"

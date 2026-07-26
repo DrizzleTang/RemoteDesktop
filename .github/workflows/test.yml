@@ -1,0 +1,91 @@
+name: test
+
+# 在 Linux runner 上跑 tests/ 下的单元测试与集成测试。
+#
+# 关于"要不要显示器(X11)"这件事:
+#   requirements.txt 里的 pynput / mss 是**被控端专用**的依赖,它们在没有
+#   DISPLAY 的 Linux 上 import 阶段就会直接抛异常(pynput 会提示
+#   "Please make sure that you have an X server running")。
+#   但仓库里的 host/ 代码已经把这类 import 推迟到函数内部并做了降级处理,
+#   所以 `import host.xxx` 本身不需要 X server,测试用例也不依赖真实屏幕。
+#   本 workflow 已在无 DISPLAY 的环境下实测通过,因此**不需要** xvfb。
+#   若将来某天有用例真的需要一块虚拟屏幕,再按下面两步改造即可:
+#     1) 加一步 `sudo apt-get install -y xvfb`
+#     2) 把运行测试的命令换成 `xvfb-run -a python -m pytest -q`
+#   (xvfb 提供一块内存里的假 X11 显示器,让 pynput/mss 能正常 import 和工作。)
+
+on:
+  push:
+    branches:
+      - '**'
+  pull_request:
+  workflow_dispatch: {}
+
+jobs:
+  unit-tests:
+    name: 单元测试
+    runs-on: ubuntu-latest
+    strategy:
+      # 一个 Python 版本挂掉时,另一个继续跑完,方便一次看清是不是版本相关问题
+      fail-fast: false
+      matrix:
+        python-version: ['3.11', '3.12']
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: 安装项目依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: 安装测试框架
+        # pytest-asyncio 是必须的:仓库根目录的 pytest.ini 里设置了
+        # asyncio_mode = auto,大量 async def 测试用例靠它自动识别并运行。
+        run: pip install pytest pytest-asyncio
+
+      - name: 运行单元测试
+        # PYTHONPATH=. 让 `from relay.server import ...` 这类以仓库根为起点的
+        # 绝对导入能正常解析(tests/ 是一个包,不显式设置容易踩到 import 路径问题)。
+        env:
+          PYTHONPATH: .
+        run: python -m pytest -q
+
+  lint:
+    name: 静态检查
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 安装 ruff
+        run: pip install ruff
+
+      - name: ruff 检查真正的错误(语法错误 / 未定义名字)
+        # 故意只选 E9(语法/IO 错误)、F63(比较写错,如 `is` 比较字面量)、
+        # F7(break/return 位置非法之类的语句错误)、F82(用了未定义的名字)
+        # 这几组"一定是 bug"的规则。
+        # 完整规则集在现有代码上会报出 50+ 条纯风格问题(行宽、typing 写法等),
+        # 那会让这个 job 长期飘红从而失去意义;收窄之后它只在真出 bug 时红,
+        # 是一道有价值的硬门禁。
+        run: ruff check . --select E9,F63,F7,F82
+
+      - name: ruff 完整规则集(仅供参考,不阻塞合并)
+        # 完整检查的输出留作改进代码风格的 TODO 清单,但不作为合并门槛,
+        # 所以 continue-on-error,红了也不会让整个 workflow 失败。
+        continue-on-error: true
+        run: ruff check . --output-format concise

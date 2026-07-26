@@ -159,6 +159,42 @@ class RelayServer:
 
         self._sweep_task: Optional[asyncio.Task] = None
         self.active_connection_count = 0
+        # 进程启动时间点(RelayServer 在进程启动时构造,所以等价于进程运行时长的
+        # 起点),供 /healthz 健康检查端点计算 uptime 用。用 monotonic 而不是
+        # time.time(),避免系统时间被 NTP 校正后算出负数或跳变。
+        self._started_at = time.monotonic()
+
+    # ------------------------------------------------------------------
+    # 健康检查用的聚合统计
+    # ------------------------------------------------------------------
+
+    def stats_snapshot(self) -> Dict[str, Any]:
+        """返回一份用于健康检查/监控的**聚合**计数快照。
+
+        故意只返回数量,不返回任何会话码(id)、对端 IP、时间戳等可用于
+        定位具体用户的信息——/healthz 通常是公网可访问的,泄露等待中的
+        会话码会直接让攻击者有机会抢注配对。
+
+        字段说明:
+
+        - ``status``:固定为 ``"ok"``,进程能响应就说明它活着。
+        - ``waiting_hosts``:已注册但仍在等待 client 配对的 host 数量。
+        - ``paired_sessions``:已经配对成功、正在转发数据的会话数量。
+          ``_active_ids`` 同时包含"等待中"和"已配对"两类 id,因此把其中
+          仍处于 ``_waiting`` 的部分刨掉,剩下的就是已配对会话。
+        - ``active_connections``:当前进行中的 WebSocket 连接总数(一个已
+          配对会话对应 2 条连接)。
+        - ``uptime_seconds``:进程启动至今的秒数。
+        """
+        waiting_hosts = len(self._waiting)
+        paired_sessions = sum(1 for sid in self._active_ids if sid not in self._waiting)
+        return {
+            "status": "ok",
+            "waiting_hosts": waiting_hosts,
+            "paired_sessions": paired_sessions,
+            "active_connections": self.active_connection_count,
+            "uptime_seconds": round(time.monotonic() - self._started_at, 3),
+        }
 
     # ------------------------------------------------------------------
     # 后台清理任务:定期回收超过 10 分钟仍未配对的等待中 host

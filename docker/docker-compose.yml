@@ -1,0 +1,79 @@
+# RemoteDesktop 中转服务器(relay)的 docker compose 示例。
+#
+# 一条命令起服务(在仓库根目录执行):
+#   docker compose -f docker/docker-compose.yml up -d --build
+# 查看日志:
+#   docker compose -f docker/docker-compose.yml logs -f
+# 停止:
+#   docker compose -f docker/docker-compose.yml down
+#
+# 说明:新版 docker compose 已不需要顶层 `version:` 字段,写了反而会告警。
+
+services:
+  relay:
+    build:
+      # 构建上下文必须是仓库根目录(即本文件的上一级),因为 Dockerfile 里
+      # 要 COPY relay/ 和 docker/healthcheck.py。
+      context: ..
+      dockerfile: docker/Dockerfile.relay
+    image: remotedesktop-relay:latest
+    container_name: remotedesktop-relay
+
+    # 服务器重启、进程异常退出后自动拉起;但人工 `docker compose down` 之后
+    # 不会自己起来(这正是 unless-stopped 相比 always 的好处)。
+    restart: unless-stopped
+
+    ports:
+      # 宿主机 8770 -> 容器 8770。只想监听内网可写成 "127.0.0.1:8770:8770"
+      # (通常配合前面再挂一层 Nginx/Caddy 做 TLS 终止时才这么用)。
+      - "8770:8770"
+
+    # 日志滚动,避免长期运行把磁盘写满
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    # ------------------------------------------------------------------
+    # 可选:启用 TLS(wss://)
+    # ------------------------------------------------------------------
+    # 把下面 volumes 和 command 两段的注释去掉即可。
+    #
+    # 关于证书路径:certbot 签发的 /etc/letsencrypt/live/<域名>/*.pem 其实是指向
+    # ../../archive/ 的**符号链接**,所以直接挂载 live 下的单个文件在续期后容易
+    # 失效;推荐整个 /etc/letsencrypt 只读挂进去。
+    #
+    # 关于权限:容器里以非 root 用户 relay 运行,而 /etc/letsencrypt/archive 下的
+    # privkey.pem 默认是 root 才可读的(0600),直接挂载会因权限不足启动失败。
+    # 两种解决办法二选一:
+    #   a) 用 certbot 的 --deploy-hook 把证书复制到一份专用目录并放宽读权限,
+    #      再把那个目录挂进来(推荐,权限面最小);
+    #   b) 临时加 `user: "0:0"` 以 root 运行容器(牺牲了非 root 的安全收益,不推荐)。
+    #
+    # volumes:
+    #   - /etc/letsencrypt:/etc/letsencrypt:ro
+    #
+    # command:
+    #   - "python"
+    #   - "-m"
+    #   - "relay.main"
+    #   - "--host"
+    #   - "0.0.0.0"
+    #   - "--port"
+    #   - "8770"
+    #   - "--cert"
+    #   - "/etc/letsencrypt/live/你的域名/fullchain.pem"
+    #   - "--key"
+    #   - "/etc/letsencrypt/live/你的域名/privkey.pem"
+
+    # ------------------------------------------------------------------
+    # 可选:资源上限
+    # ------------------------------------------------------------------
+    # relay 只转发不解码,内存占用很小(见 docs/deploy_relay.md 的估算)。
+    # 想防止极端情况下把宿主机吃满,可以放开下面的限制:
+    # deploy:
+    #   resources:
+    #     limits:
+    #       cpus: "1.0"
+    #       memory: 512M

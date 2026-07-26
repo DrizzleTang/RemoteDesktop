@@ -309,3 +309,128 @@ html, body {
   cursor: pointer;
   font-size: 12px;
 }
+
+/* ---------- 只读观看角色徽章 ---------- */
+.badge.warn { color: var(--yellow); border-color: var(--yellow); }
+
+/* ---------- 下拉框(清晰度 / 显示器) ---------- */
+.select-label { display: flex; align-items: center; gap: 6px; color: var(--text-dim); }
+
+#quality-select,
+#monitor-select {
+  background: #12151b;
+  color: var(--text);
+  border: 1px solid var(--panel-border);
+  border-radius: 6px;
+  padding: 4px 6px;
+  max-width: 180px;
+}
+
+/* ---------- 断线遮罩 ----------
+   画面会停在断线前的最后一帧,必须有明确的视觉提示告诉用户"现在点了没用",
+   同时用 pointer-events 拦住点击,避免误操作。 */
+#screen-overlay {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  background: rgba(10, 12, 16, 0.72);
+  backdrop-filter: blur(2px);
+  z-index: 10;
+  pointer-events: all;
+  text-align: center;
+  padding: 20px;
+}
+
+#screen-overlay-text { font-size: 15px; color: var(--text); }
+.overlay-sub { font-size: 12px; color: var(--text-dim); }
+
+.overlay-spinner {
+  width: 30px;
+  height: 30px;
+  border: 3px solid rgba(255, 255, 255, 0.15);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 0.9s linear infinite;
+}
+
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* ---------- 拖拽文件到画面 ---------- */
+#canvas-wrap.dragover::after {
+  content: "松开即可把文件发送到对方电脑";
+  position: absolute;
+  inset: 12px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 2px dashed var(--accent);
+  border-radius: 12px;
+  background: rgba(79, 140, 255, 0.12);
+  color: var(--text);
+  font-size: 15px;
+  z-index: 20;
+  pointer-events: none;
+}
+
+/* ---------- 文件传输进度 ---------- */
+#transfer-panel {
+  max-height: 30vh;
+  overflow-y: auto;
+  padding: 8px 14px 10px;
+  background: var(--panel);
+  border-top: 1px solid var(--panel-border);
+}
+
+.transfer-title { font-size: 12px; color: var(--text-dim); margin-bottom: 6px; }
+
+.transfer-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 140px 150px;
+  align-items: center;
+  gap: 10px;
+  padding: 4px 0;
+  font-size: 12px;
+}
+
+.transfer-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.transfer-bar {
+  height: 6px;
+  background: #12151b;
+  border-radius: 999px;
+  overflow: hidden;
+}
+
+.transfer-bar-fill {
+  height: 100%;
+  width: 0;
+  background: var(--accent);
+  transition: width 0.2s;
+}
+
+.transfer-meta { color: var(--text-dim); text-align: right; }
+.transfer-row.done .transfer-bar-fill { background: var(--green); }
+.transfer-row.error .transfer-bar-fill { background: var(--red); }
+.transfer-row.error .transfer-meta { color: var(--red); }
+
+/* ---------- 触屏适配 ---------- */
+#screen {
+  touch-action: none; /* 关掉浏览器自身的滚动/缩放手势,手势全部交给 input.js 解释 */
+}
+
+@media (max-width: 720px) {
+  #toolbar { gap: 6px; padding: 6px 8px; font-size: 12px; }
+  .toolbar-group { gap: 6px; }
+  #toolbar button { padding: 5px 8px; font-size: 12px; }
+  .stats-text { display: none; }
+  .transfer-row { grid-template-columns: minmax(0, 1fr) 80px; }
+  .transfer-row .transfer-meta { display: none; }
+}

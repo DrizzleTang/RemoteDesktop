@@ -2,8 +2,9 @@
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
 <title>远程桌面 - 主控端</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='12' fill='%231f2937'/%3E%3Crect x='12' y='16' width='40' height='26' rx='4' fill='none' stroke='%2360a5fa' stroke-width='4'/%3E%3Crect x='26' y='44' width='12' height='4' fill='%2360a5fa'/%3E%3C/svg%3E">
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
@@ -50,10 +51,11 @@
       <span id="status-dot" class="status-dot"></span>
       <span id="status-text">未连接</span>
       <span id="latency-badge" class="badge">-- ms</span>
+      <span id="role-badge" class="badge warn" style="display:none">只读观看</span>
     </div>
 
     <div class="toolbar-group">
-      <label class="quality-label">清晰度
+      <label class="select-label">清晰度
         <select id="quality-select">
           <option value="auto" selected>智能(自动)</option>
           <option value="extreme">极速</option>
@@ -64,10 +66,14 @@
           <option value="custom">自定义</option>
         </select>
       </label>
+      <label class="select-label" id="monitor-wrap" style="display:none">显示器
+        <select id="monitor-select"></select>
+      </label>
       <span id="stats-text" class="stats-text"></span>
     </div>
 
     <div class="toolbar-group">
+      <button type="button" id="btn-send-file" title="发送文件到对方电脑(也可直接把文件拖到画面上)">发送文件</button>
       <button type="button" id="btn-send-clipboard" title="把本机剪贴板发送到对方">发送剪贴板</button>
       <button type="button" id="btn-fullscreen" title="全屏">全屏</button>
       <button type="button" id="btn-disconnect" class="danger-btn">断开连接</button>
@@ -82,11 +88,24 @@
 
   <div id="canvas-wrap">
     <canvas id="screen" tabindex="0"></canvas>
-    <div id="canvas-hint">点击画面开始操作(鼠标 / 键盘将被转发到对方电脑)</div>
+    <div id="screen-overlay" style="display:none">
+      <div class="overlay-spinner"></div>
+      <div id="screen-overlay-text">连接已断开,正在自动重连…</div>
+      <div class="overlay-sub">画面为断线前的最后一帧,此时的操作不会生效</div>
+    </div>
+    <div id="canvas-hint">点击画面开始操作(鼠标 / 键盘将被转发到对方电脑;可把文件拖到这里发送)</div>
+  </div>
+
+  <div id="transfer-panel" style="display:none">
+    <div class="transfer-title">文件传输</div>
+    <div id="transfer-list"></div>
   </div>
 </div>
 
+<input type="file" id="file-input" multiple style="display:none">
+
 <div id="toast" class="toast" style="display:none"></div>
+
 <div id="clipboard-fallback" class="clipboard-fallback" style="display:none">
   <div class="clipboard-fallback-title">收到对方剪贴板内容(浏览器阻止了自动写入):</div>
   <textarea id="clipboard-fallback-text" readonly></textarea>
@@ -96,6 +115,6 @@
   </div>
 </div>
 
-<script src="app.js"></script>
+<script type="module" src="js/app.js"></script>
 </body>
 </html>

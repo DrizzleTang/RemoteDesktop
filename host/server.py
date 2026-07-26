@@ -10,18 +10,24 @@
   的情况。
 
 无论哪种接入方式,配对成功后都会得到一个普通的 WebSocket 连接对象,
-后续的密钥交换、加密、视频帧/输入/剪贴板收发逻辑完全一致,由 Session 类
-统一处理。
+后续的密钥交换、加密、收发逻辑完全一致,由 Session 类统一处理;而具体的
+画面推流策略在 host/streamer.py 里。
+
+多人观看:直连模式下可以允许额外的"只读观看者"接入(默认关闭,用
+--max-viewers 开启)。第一个连上的会话持有操作权,其余会话只能看画面,
+所有输入类消息都会被忽略。持有操作权的一方断开后,操作权自动移交给
+仍在线的最早的观看者。中转模式受限于 relay 的一对一配对语义,只支持
+一个会话。
 """
 from __future__ import annotations
 
 import asyncio
-import functools
 import json
 import logging
 import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from pathlib import Path
 
 import websockets
 from websockets.exceptions import ConnectionClosed
@@ -31,10 +37,17 @@ from common.adaptive import AdaptiveController
 from common.protocol import (
     T_BYE,
     T_CLIPBOARD,
+    T_FILE_ABORT,
+    T_FILE_BEGIN,
+    T_FILE_DONE,
+    T_FILE_END,
+    T_FILE_ERROR,
     T_FRAME_ACK,
     T_HELLO,
     T_HELLO_ACK,
     T_KEY,
+    T_MONITOR_INFO,
+    T_MONITOR_SET,
     T_MOUSE_BUTTON,
     T_MOUSE_MOVE,
     T_MOUSE_SCROLL,
@@ -42,17 +55,19 @@ from common.protocol import (
     T_PONG,
     T_QUALITY_SET,
     T_STATS,
+    T_VIEWER_INFO,
 )
 from host.capture import ScreenCapture
 from host.clipboard import ClipboardSync
+from host.delta import DirtyTracker
+from host.filetransfer import FileReceiver, FileTransferError
 from host.input_injector import InputInjector, InputUnavailableError
+from host.sendqueue import PRIORITY_CONTROL, PrioritySendQueue
+from host.streamer import FrameStreamer
 
 logger = logging.getLogger("host.server")
 
-FRAME_ACK_BASE_TIMEOUT_S = 0.35
-FRAME_ACK_MAX_TIMEOUT_S = 2.5
 STATS_INTERVAL_S = 1.0
-STATS_WINDOW_S = 5.0
 HELLO_TIMEOUT_S = 8.0
 MAX_FAILED_AUTH_PER_WINDOW = 5
 AUTH_WINDOW_S = 60.0
@@ -67,7 +82,6 @@ AUTH_BLOCK_S = 120.0
 # AUTH_BLOCK_S)。详见 docs/architecture.md "安全设计取舍说明"。
 RELAY_AUTH_BLOCK_S = 15.0
 MAX_WS_MESSAGE_BYTES = 8 * 1024 * 1024
-SEND_QUEUE_MAXSIZE = 64
 CLIPBOARD_MIN_APPLY_INTERVAL_S = 0.3  # 限制 clip 消息处理频率,避免被用来刷剪贴板子进程
 
 
@@ -80,6 +94,9 @@ class HostConfig:
     relay_url: str | None = None
     monitor_index: int = 1
     host_name: str = "host"
+    download_dir: Path = field(default_factory=lambda: Path.home() / "RemoteDesktop-收到的文件")
+    max_viewers: int = 1  # 允许同时连接的会话总数(1 = 仅一个操作者,无额外观看者)
+    allow_file_transfer: bool = True
 
 
 class AuthRateLimiter:
@@ -120,35 +137,66 @@ def _extract_ip(ws) -> str:
 
 
 class Session:
-    """一次 host<->client 连接的完整生命周期:握手、鉴权、以及后续的
-    视频帧 / 输入 / 剪贴板 / 心跳收发。"""
+    """一次 host<->client 连接的完整生命周期:握手、鉴权,以及后续的
+    画面推流 / 输入注入 / 剪贴板 / 文件接收 / 心跳收发。"""
 
     def __init__(self, ws, config: HostConfig, capture_executor: ThreadPoolExecutor,
-                 rate_limiter: AuthRateLimiter, peer_ip: str):
+                 rate_limiter: AuthRateLimiter, peer_ip: str, can_control: bool):
         self.ws = ws
         self.config = config
         self.capture_executor = capture_executor
         self.rate_limiter = rate_limiter
         self.peer_ip = peer_ip
+        self.can_control = can_control
 
         self.cipher: crypto.SessionCipher | None = None
         self.adaptive = AdaptiveController()
         self.capture = ScreenCapture(monitor_index=config.monitor_index)
         self.injector: InputInjector | None = None
         self.clipboard: ClipboardSync | None = None
+        self.files: FileReceiver | None = None
+        self.streamer: FrameStreamer | None = None
 
-        self.send_queue: asyncio.Queue = asyncio.Queue(maxsize=SEND_QUEUE_MAXSIZE)
-        self._frame_seq = 0
-        self._pending_frame_seq: int | None = None
-        self._frame_sent_at: float = 0.0
-        self._frame_ack_event = asyncio.Event()
-        self._recent_frames: list[tuple[float, int]] = []  # (发送时间, 字节数),用于统计实际 fps/码率
-        self._last_clipboard_apply_ts: float = 0.0
+        self.send_queue = PrioritySendQueue()
+        self._last_clipboard_apply_ts = 0.0
         self._start_ts = time.monotonic()
-        self._loop = asyncio.get_event_loop()
+        self._loop = asyncio.get_running_loop()
+        self._closed = False
+
+    # ------------------------------------------------------------------
+    # 基础工具
+    # ------------------------------------------------------------------
 
     def _now_ms(self) -> int:
         return int((time.monotonic() - self._start_ts) * 1000)
+
+    def _enqueue_wire(self, wire_bytes: bytes, priority: int = PRIORITY_CONTROL) -> None:
+        """把**已加密**的字节放入发送队列。"""
+        self.send_queue.put_nowait(wire_bytes, priority)
+
+    def _send_plaintext(self, plaintext: bytes, priority: int = PRIORITY_CONTROL) -> None:
+        """加密一段明文 payload 后入队。
+
+        所有出站数据都必须经过这里(或等价的加密步骤)——包括视频帧。
+        画面内容是本项目最敏感的数据,一旦漏加密,中转服务器就能直接看到
+        对方的屏幕,端到端加密的设计前提就被破坏了。
+        """
+        if self.cipher is None:
+            return
+        self._enqueue_wire(self.cipher.encrypt(plaintext), priority)
+
+    def _send_control_nowait(self, msg: dict) -> None:
+        try:
+            self._send_plaintext(protocol.encode_control(msg), PRIORITY_CONTROL)
+        except protocol.ProtocolError:
+            logger.debug("控制消息过大,已丢弃: %s", msg.get("t"))
+
+    async def _send_control(self, msg: dict) -> None:
+        self._send_control_nowait(msg)
+
+    # ------------------------------------------------------------------
+    # 握手
+    # ------------------------------------------------------------------
 
     async def _handshake(self) -> None:
         salt = crypto.new_salt()
@@ -165,51 +213,75 @@ class Session:
         if kind != protocol.MSG_CONTROL or msg.get("t") != T_HELLO:
             raise protocol.ProtocolError("expected hello message")
 
-        width, height = await self._loop.run_in_executor(self.capture_executor, lambda: self.capture.screen_size)
-        try:
-            self.injector = InputInjector(width, height)
-            input_ok = True
-        except InputUnavailableError as exc:
-            logger.warning("输入注入不可用(仅能观看画面,无法操作): %s", exc)
-            self.injector = None
-            input_ok = False
+        monitors = await self._loop.run_in_executor(self.capture_executor, self.capture.list_monitors)
+        width, height = await self._loop.run_in_executor(
+            self.capture_executor, lambda: self.capture.screen_size
+        )
+
+        input_ok = False
+        if self.can_control:
+            try:
+                self.injector = InputInjector(width, height)
+                input_ok = True
+            except InputUnavailableError as exc:
+                logger.warning("输入注入不可用(仅能观看画面,无法操作): %s", exc)
+                self.injector = None
+
+        if self.can_control and self.config.allow_file_transfer:
+            self.files = FileReceiver(self.config.download_dir)
 
         await self._send_control({
-            "t": T_HELLO_ACK, "width": width, "height": height,
-            "host_name": self.config.host_name, "input_available": input_ok,
+            "t": T_HELLO_ACK,
+            "width": width, "height": height,
+            "host_name": self.config.host_name,
+            "input_available": input_ok,
+            "can_control": self.can_control,
+            "file_transfer": self.files is not None,
+            "monitors": [
+                {"index": m.index, "label": m.label, "width": m.width,
+                 "height": m.height, "primary": m.is_primary}
+                for m in monitors
+            ],
+            "current_monitor": self.capture.monitor_index,
         })
 
         self.clipboard = ClipboardSync(on_local_change=self._on_local_clipboard_change)
         self.clipboard.start()
 
+        self.streamer = FrameStreamer(
+            capture=self.capture, tracker=DirtyTracker(), adaptive=self.adaptive,
+            executor=self.capture_executor, send=self._send_plaintext, now_ms=self._now_ms,
+        )
+
+    # ------------------------------------------------------------------
+    # 剪贴板
+    # ------------------------------------------------------------------
+
     def _on_local_clipboard_change(self, text: str) -> None:
+        """由剪贴板轮询线程调用,需要跨线程投递到事件循环。"""
+        if self.cipher is None:
+            return
         try:
             payload = self.cipher.encrypt(protocol.encode_control({"t": T_CLIPBOARD, "text": text}))
         except Exception:  # noqa: BLE001
             return
-        self._loop.call_soon_threadsafe(self._enqueue_nowait, payload)
+        self._loop.call_soon_threadsafe(self._enqueue_wire, payload, PRIORITY_CONTROL)
 
-    def _enqueue_nowait(self, payload: bytes) -> None:
-        try:
-            self.send_queue.put_nowait(payload)
-        except asyncio.QueueFull:
-            logger.debug("发送队列已满,丢弃一条消息")
+    async def _on_clipboard_message(self, msg: dict) -> None:
+        text = msg.get("text", "")
+        if not isinstance(text, str) or not self.clipboard:
+            return
+        now = time.monotonic()
+        if now - self._last_clipboard_apply_ts < CLIPBOARD_MIN_APPLY_INTERVAL_S:
+            return  # 简单限流:防止刷 clip 消息导致反复拉起剪贴板子进程
+        self._last_clipboard_apply_ts = now
+        # pyperclip 在 Linux 下通过子进程(xclip/xsel)读写剪贴板,是阻塞调用,
+        # 必须放到线程池里执行,避免卡住 asyncio 事件循环(进而卡住整条会话)。
+        await self._loop.run_in_executor(None, self.clipboard.apply_remote, text)
 
-    async def _enqueue(self, payload: bytes) -> None:
-        try:
-            self.send_queue.put_nowait(payload)
-        except asyncio.QueueFull:
-            logger.debug("发送队列已满,丢弃一条消息")
-
-    async def _send_control(self, msg: dict) -> None:
-        payload = self.cipher.encrypt(protocol.encode_control(msg))
-        await self._enqueue(payload)
-
-    def _current_ack_timeout(self) -> float:
-        ewma = self.adaptive.ewma_latency_ms
-        if ewma is None:
-            return FRAME_ACK_BASE_TIMEOUT_S
-        return min(FRAME_ACK_MAX_TIMEOUT_S, max(FRAME_ACK_BASE_TIMEOUT_S, (ewma / 1000) * 3))
+    # ------------------------------------------------------------------
+    # 收发循环
+    # ------------------------------------------------------------------
 
     async def _writer_loop(self) -> None:
         while True:
@@ -226,18 +298,36 @@ class Session:
             except (crypto.CryptoError, protocol.ProtocolError) as exc:
                 logger.debug("丢弃无法解析的消息: %s", exc)
                 continue
-            if kind != protocol.MSG_CONTROL:
-                continue
-            await self._dispatch_control(msg)
+            if kind == protocol.MSG_CONTROL:
+                await self._dispatch_control(msg)
+            elif kind == protocol.MSG_FILE_CHUNK:
+                await self._on_file_chunk(msg)
 
     async def _dispatch_control(self, msg: dict) -> None:
         t = msg.get("t")
         try:
+            # ---- 所有会话(含只读观看者)都能用的消息 ----
             if t == T_PING:
-                await self._send_control({"t": T_PONG, "ts": msg.get("ts"), "n": msg.get("n"), "server_ts": self._now_ms()})
-            elif t == T_FRAME_ACK:
-                self._on_frame_ack(msg)
-            elif t == T_MOUSE_MOVE:
+                await self._send_control({
+                    "t": T_PONG, "ts": msg.get("ts"), "n": msg.get("n"), "server_ts": self._now_ms(),
+                })
+                return
+            if t == T_FRAME_ACK:
+                if self.streamer:
+                    self.streamer.on_frame_ack(msg.get("seq"))
+                return
+            if t == T_QUALITY_SET:
+                self._on_quality_set(msg)
+                return
+            if t == T_BYE:
+                await self._safe_close()
+                return
+
+            # ---- 以下消息需要操作权 ----
+            if not self.can_control:
+                return
+
+            if t == T_MOUSE_MOVE:
                 if self.injector:
                     self.injector.move(float(msg["x"]), float(msg["y"]))
             elif t == T_MOUSE_BUTTON:
@@ -251,10 +341,14 @@ class Session:
                     self.injector.key(code=msg.get("code"), key_char=msg.get("key"), down=bool(msg["down"]))
             elif t == T_CLIPBOARD:
                 await self._on_clipboard_message(msg)
-            elif t == T_QUALITY_SET:
-                self._on_quality_set(msg)
-            elif t == T_BYE:
-                await self._safe_close()
+            elif t == T_MONITOR_SET:
+                await self._on_monitor_set(msg)
+            elif t == T_FILE_BEGIN:
+                await self._on_file_begin(msg)
+            elif t == T_FILE_END:
+                await self._on_file_end(msg)
+            elif t == T_FILE_ABORT:
+                await self._on_file_abort(msg)
         except InputUnavailableError:
             pass
         except (KeyError, ValueError, TypeError) as exc:
@@ -264,26 +358,6 @@ class Session:
             # 某些按键释放路径上会抛出继承自 Exception 的 InvalidKeyException);
             # 一条畸形/极端的控制消息不应该把整个会话的 recv_loop 直接打崩。
             logger.exception("处理控制消息 %s 时发生未预期异常,已忽略", t)
-
-    async def _on_clipboard_message(self, msg: dict) -> None:
-        text = msg.get("text", "")
-        if not isinstance(text, str) or not self.clipboard:
-            return
-        now = time.monotonic()
-        if now - self._last_clipboard_apply_ts < CLIPBOARD_MIN_APPLY_INTERVAL_S:
-            return  # 简单限流:防止刷 clip 消息导致反复拉起剪贴板子进程
-        self._last_clipboard_apply_ts = now
-        # pyperclip 在 Linux 下通过子进程(xclip/xsel)读写剪贴板,是阻塞调用,
-        # 必须放到线程池里执行,避免卡住 asyncio 事件循环(进而卡住整条会话)。
-        await self._loop.run_in_executor(None, self.clipboard.apply_remote, text)
-
-    def _on_frame_ack(self, msg: dict) -> None:
-        if msg.get("seq") != self._pending_frame_seq:
-            return  # 过期或重复的 ack
-        latency_ms = max(0.0, (time.monotonic() - self._frame_sent_at) * 1000)
-        self.adaptive.on_frame_ack(latency_ms)
-        self._pending_frame_seq = None
-        self._frame_ack_event.set()
 
     def _on_quality_set(self, msg: dict) -> None:
         mode = msg.get("mode")
@@ -297,73 +371,114 @@ class Session:
         except ValueError:
             logger.debug("忽略非法画质模式: %s", mode)
 
-    async def _frame_loop(self) -> None:
-        loop = asyncio.get_event_loop()
-        while True:
-            t0 = time.monotonic()
-            params = self.adaptive.current_params()
-            fn = functools.partial(
-                self.capture.grab_and_encode, scale=params["scale"], jpeg_quality=int(params["jpeg_quality"]),
+    # ------------------------------------------------------------------
+    # 显示器切换
+    # ------------------------------------------------------------------
+
+    async def _on_monitor_set(self, msg: dict) -> None:
+        index = msg.get("index")
+        if not isinstance(index, int):
+            return
+        ok = await self._loop.run_in_executor(self.capture_executor, self.capture.set_monitor, index)
+        if not ok:
+            await self._send_control({"t": T_MONITOR_INFO, "ok": False, "reason": "显示器编号无效"})
+            return
+        width, height = await self._loop.run_in_executor(
+            self.capture_executor, lambda: self.capture.screen_size
+        )
+        if self.injector:
+            self.injector.update_screen_size(width, height)
+        if self.streamer:
+            # 画面尺寸/内容整个换了,必须重置差分状态并强制发一个整帧
+            self.streamer.request_keyframe()
+        await self._send_control({
+            "t": T_MONITOR_INFO, "ok": True, "index": index, "width": width, "height": height,
+        })
+        logger.info("已切换到显示器 %d (%dx%d)", index, width, height)
+
+    # ------------------------------------------------------------------
+    # 文件接收
+    # ------------------------------------------------------------------
+
+    async def _on_file_begin(self, msg: dict) -> None:
+        if self.files is None:
+            await self._send_control({"t": T_FILE_ERROR, "id": msg.get("id"), "message": "被控端已禁用文件传输"})
+            return
+        transfer_id, name, size = msg.get("id"), msg.get("name"), msg.get("size")
+        try:
+            await self._loop.run_in_executor(None, self.files.begin, transfer_id, name, size)
+        except FileTransferError as exc:
+            await self._send_control({"t": T_FILE_ERROR, "id": transfer_id, "message": str(exc)})
+            return
+        logger.info("开始接收文件: %s (%s 字节)", name, size)
+        # 回一条 received=0 的进度,作为"已就绪、可以开始发分块"的确认
+        await self._send_control({"t": protocol.T_FILE_PROGRESS, "id": transfer_id, "received": 0})
+
+    async def _on_file_chunk(self, chunk) -> None:
+        if not self.can_control or self.files is None:
+            return
+        try:
+            received = await self._loop.run_in_executor(
+                None, self.files.write_chunk, chunk.transfer_id, chunk.seq, chunk.data
             )
-            try:
-                encoded = await loop.run_in_executor(self.capture_executor, fn)
-            except Exception:  # noqa: BLE001
-                logger.exception("屏幕采集失败,1 秒后重试")
-                await asyncio.sleep(1.0)
-                continue
+        except FileTransferError as exc:
+            await self._send_control({"t": T_FILE_ERROR, "id": chunk.transfer_id, "message": str(exc)})
+            await self._loop.run_in_executor(None, self.files.abort, chunk.transfer_id)
+            return
+        # 每 16 块回一次进度,避免进度消息本身占用过多带宽
+        if chunk.seq % 16 == 0:
+            await self._send_control({
+                "t": protocol.T_FILE_PROGRESS, "id": chunk.transfer_id, "received": received,
+            })
 
-            self._frame_seq += 1
-            seq = self._frame_seq
-            payload = protocol.encode_video_frame(
-                seq=seq, ts_ms=self._now_ms(), width=encoded.width, height=encoded.height,
-                quality=int(params["jpeg_quality"]), fmt=protocol.FMT_JPEG, keyframe=True,
-                image_bytes=encoded.jpeg_bytes,
-            )
-            wire = self.cipher.encrypt(payload)
+    async def _on_file_end(self, msg: dict) -> None:
+        if self.files is None:
+            return
+        transfer_id = msg.get("id")
+        try:
+            path = await self._loop.run_in_executor(None, self.files.finish, transfer_id)
+        except FileTransferError as exc:
+            await self._send_control({"t": T_FILE_ERROR, "id": transfer_id, "message": str(exc)})
+            return
+        logger.info("文件接收完成: %s", path)
+        await self._send_control({"t": T_FILE_DONE, "id": transfer_id, "path": path.name})
 
-            self._pending_frame_seq = seq
-            self._frame_ack_event.clear()
-            self._frame_sent_at = time.monotonic()
-            await self._enqueue(wire)
+    async def _on_file_abort(self, msg: dict) -> None:
+        if self.files is None:
+            return
+        await self._loop.run_in_executor(None, self.files.abort, msg.get("id"))
 
-            now = time.monotonic()
-            self._recent_frames.append((now, len(encoded.jpeg_bytes)))
-            cutoff = now - STATS_WINDOW_S
-            if len(self._recent_frames) > 256 or (self._recent_frames and self._recent_frames[0][0] < cutoff):
-                self._recent_frames = [f for f in self._recent_frames if f[0] >= cutoff]
-
-            try:
-                await asyncio.wait_for(self._frame_ack_event.wait(), timeout=self._current_ack_timeout())
-            except asyncio.TimeoutError:
-                if self._pending_frame_seq == seq:
-                    self._pending_frame_seq = None
-                    self.adaptive.on_frame_timeout()
-
-            target_fps = max(1.0, params["max_fps"])
-            min_interval = 1.0 / target_fps
-            elapsed = time.monotonic() - t0
-            if elapsed < min_interval:
-                await asyncio.sleep(min_interval - elapsed)
-
-    def _actual_throughput(self) -> tuple[float, float]:
-        now = time.monotonic()
-        cutoff = now - STATS_WINDOW_S
-        recent = [f for f in self._recent_frames if f[0] >= cutoff]
-        if len(recent) < 2:
-            return 0.0, 0.0
-        span = max(0.5, now - recent[0][0])
-        fps = len(recent) / span
-        kbps = sum(b for _, b in recent) * 8 / 1000 / span
-        return fps, kbps
+    # ------------------------------------------------------------------
+    # 统计上报
+    # ------------------------------------------------------------------
 
     async def _stats_loop(self) -> None:
         while True:
             await asyncio.sleep(STATS_INTERVAL_S)
             snap = self.adaptive.stats_snapshot()
-            fps, kbps = self._actual_throughput()
-            snap["actual_fps"] = round(fps, 1)
-            snap["actual_kbps"] = round(kbps, 1)
+            if self.streamer:
+                snap.update(self.streamer.stats())
             await self._send_control({"t": T_STATS, **snap})
+
+    def notify_control_granted(self) -> None:
+        """由 HostServer 在操作权移交给本会话时调用。"""
+        self.can_control = True
+        try:
+            width, height = self.capture.screen_size
+            self.injector = InputInjector(width, height)
+        except (InputUnavailableError, Exception):  # noqa: BLE001
+            self.injector = None
+        if self.config.allow_file_transfer and self.files is None:
+            self.files = FileReceiver(self.config.download_dir)
+        self._send_control_nowait({
+            "t": T_VIEWER_INFO, "can_control": True,
+            "input_available": self.injector is not None,
+            "file_transfer": self.files is not None,
+        })
+
+    # ------------------------------------------------------------------
+    # 生命周期
+    # ------------------------------------------------------------------
 
     async def _safe_close(self) -> None:
         try:
@@ -386,12 +501,12 @@ class Session:
             return
 
         self.rate_limiter.record_success(self.peer_ip)
-        logger.info("会话已建立,来源 %s", self.peer_ip)
+        logger.info("会话已建立,来源 %s(%s)", self.peer_ip, "操作者" if self.can_control else "只读观看")
 
         tasks = [
             asyncio.create_task(self._writer_loop(), name="writer"),
             asyncio.create_task(self._recv_loop(), name="recv"),
-            asyncio.create_task(self._frame_loop(), name="frame"),
+            asyncio.create_task(self.streamer.run(), name="frame"),
             asyncio.create_task(self._stats_loop(), name="stats"),
         ]
         try:
@@ -402,11 +517,12 @@ class Session:
             await asyncio.gather(*tasks, return_exceptions=True)
             if self.clipboard:
                 self.clipboard.stop()
-            # capture_executor 是单线程池,任务严格按提交顺序执行;取消
-            # _frame_loop 只是不再提交新的 grab_and_encode 调用,并不能中断
-            # 一次已经在执行中的调用。这里提交一个空任务并等待它完成,借助
-            # "单线程 FIFO"的性质确保上一次 grab_and_encode(如果还在跑)已经
-            # 结束,再去关闭底层的 mss 实例,避免跨线程并发访问同一个对象。
+            if self.files:
+                self.files.cleanup_all()
+            # capture_executor 是单线程池,任务严格按提交顺序执行;取消推流
+            # 协程只是不再提交新的采集调用,并不能中断一次已经在执行中的调用。
+            # 这里提交一个空任务并等待它完成,借助"单线程 FIFO"的性质确保
+            # 上一次采集已经结束,再去关闭底层的 mss 实例,避免跨线程并发访问。
             await self._loop.run_in_executor(self.capture_executor, lambda: None)
             self.capture.close()
             await self._safe_close()
@@ -418,7 +534,7 @@ class HostServer:
         self.config = config
         self.rate_limiter = AuthRateLimiter()
         self.capture_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="capture")
-        self._session_active = False
+        self._sessions: list[Session] = []
 
     async def _reject(self, ws, reason: str) -> None:
         try:
@@ -430,22 +546,45 @@ class HostServer:
         except Exception:  # noqa: BLE001
             pass
 
+    def _max_sessions(self) -> int:
+        # 中转模式下 relay 是一对一配对的,多观看者无从谈起
+        if self.config.relay_url:
+            return 1
+        return max(1, self.config.max_viewers)
+
     async def _handle_ws(self, ws) -> None:
         peer_ip = _extract_ip(ws)
         if self.rate_limiter.is_blocked(peer_ip):
             logger.info("拒绝来源 %s:近期认证失败次数过多", peer_ip)
             await self._reject(ws, "rate_limited")
             return
-        if self._session_active:
-            logger.info("拒绝来源 %s:当前已有活跃会话", peer_ip)
+        if len(self._sessions) >= self._max_sessions():
+            logger.info("拒绝来源 %s:已达最大会话数 %d", peer_ip, self._max_sessions())
             await self._reject(ws, "busy")
             return
-        self._session_active = True
+
+        # 当前没有任何会话持有操作权时,新会话即为操作者
+        can_control = not any(s.can_control for s in self._sessions)
+        session = Session(ws, self.config, self.capture_executor, self.rate_limiter, peer_ip, can_control)
+        self._sessions.append(session)
         try:
-            session = Session(ws, self.config, self.capture_executor, self.rate_limiter, peer_ip)
             await session.run()
         finally:
-            self._session_active = False
+            if session in self._sessions:
+                self._sessions.remove(session)
+            if session.can_control:
+                self._promote_next_controller()
+
+    def _promote_next_controller(self) -> None:
+        """操作者离开后,把操作权移交给仍在线的最早的观看者。
+
+        所有会话都通过了同一个密码认证,彼此信任等级相同,因此这种自动移交
+        不会带来额外的权限提升风险。"""
+        for session in self._sessions:
+            if not session.can_control:
+                logger.info("操作权已移交给来源 %s", session.peer_ip)
+                session.notify_control_granted()
+                return
 
     async def serve_direct(self) -> None:
         async with websockets.serve(
