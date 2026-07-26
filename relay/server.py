@@ -43,7 +43,14 @@ logger = logging.getLogger("relay.server")
 # 协议常量
 # ---------------------------------------------------------------------------
 
-ID_RE = re.compile(r"^[A-Za-z0-9]{4,32}$")
+# 最短 6 位(而不是更容易被撞中的 4 位):见"短会话码可能被抢注"的安全评估——
+# 若运维通过 host --id 手动指定一个很短的会话码,在长达 10 分钟的等待配对
+# 窗口内,攻击者有可能在合法 client 之前抢先以该 id 注册为 client 并完成配对
+# (即便如此,由于应用层握手仍需要正确密码才能通过,攻击者拿到的只是一次
+# "抢先配对"的机会,并不能绕过密码认证;但会造成合法 client 得到
+# host_not_found 的拒绝服务)。6 位字母数字组合空间(62**6 ≈ 5.68×10^10)
+# 配合按 IP 的注册频率限制,让这种抢注在实践中不再可行。
+ID_RE = re.compile(r"^[A-Za-z0-9]{6,32}$")
 PROTOCOL_VERSION = 1
 
 MAX_REGISTER_MESSAGE_BYTES = 2048
@@ -102,7 +109,11 @@ class _WaitingHost:
     registered_at: float
     event: asyncio.Event = field(default_factory=asyncio.Event)
     peer: Any = None
-    limiter: Optional[_RateLimiter] = None
+    # host->client 和 client->host 两个方向各自独立的令牌桶限速器,避免
+    # 双向流量共用同一个预算(否则总吞吐会被意外腰斩,且两个方向的突发
+    # 流量会互相挤占对方的配额)。
+    limiter_host_to_client: Optional[_RateLimiter] = None
+    limiter_client_to_host: Optional[_RateLimiter] = None
 
 
 class RelayServer:
@@ -173,6 +184,23 @@ class RelayServer:
                 await self._sweep_expired_waiting_hosts()
             except Exception:  # pragma: no cover - 防御性:后台任务不应崩溃
                 logger.exception("清理等待中 host 时发生异常")
+            try:
+                self._sweep_stale_register_attempts()
+            except Exception:  # pragma: no cover - 防御性:后台任务不应崩溃
+                logger.exception("清理注册限流记录时发生异常")
+
+    def _sweep_stale_register_attempts(self) -> None:
+        # _check_register_rate_limit 只会从 deque 里弹出过期的时间戳,不会
+        # 删除已经清空的 IP 键本身;长期运行的 relay 进程如果被大量不同来源
+        # IP 访问过(哪怕只访问一次),这个字典会无界增长。这里定期扫一遍,
+        # 把窗口内已经没有任何有效时间戳的 IP 键彻底删除,释放内存。
+        window_start = time.monotonic() - self.register_rate_limit_window
+        stale_ips = [
+            ip for ip, attempts in self._register_attempts.items()
+            if not attempts or attempts[-1] < window_start
+        ]
+        for ip in stale_ips:
+            del self._register_attempts[ip]
 
     async def _sweep_expired_waiting_hosts(self) -> None:
         now = time.monotonic()
@@ -350,7 +378,7 @@ class RelayServer:
             await self._teardown_session(session_id, peer)
             return
 
-        await self._forward_loop(websocket, peer, entry.limiter, session_id)
+        await self._forward_loop(websocket, peer, entry.limiter_host_to_client, session_id)
 
     async def _wait_for_pairing_or_disconnect(
         self, websocket: Any, session_id: str, entry: _WaitingHost
@@ -385,9 +413,10 @@ class RelayServer:
             await self._safe_close(websocket, 1008, "host_not_found")
             return
 
-        limiter = _RateLimiter(self.forward_rate_limit_bytes_per_sec)
         entry.peer = websocket
-        entry.limiter = limiter
+        entry.limiter_host_to_client = _RateLimiter(self.forward_rate_limit_bytes_per_sec)
+        limiter_client_to_host = _RateLimiter(self.forward_rate_limit_bytes_per_sec)
+        entry.limiter_client_to_host = limiter_client_to_host
         entry.event.set()
 
         logger.info("id=%s client 配对成功,进入转发模式", session_id)
@@ -395,7 +424,7 @@ class RelayServer:
             await self._teardown_session(session_id, entry.websocket)
             return
 
-        await self._forward_loop(websocket, entry.websocket, limiter, session_id)
+        await self._forward_loop(websocket, entry.websocket, limiter_client_to_host, session_id)
 
     # ------------------------------------------------------------------
     # 纯转发模式

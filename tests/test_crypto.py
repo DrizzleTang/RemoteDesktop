@@ -77,7 +77,31 @@ def test_nonce_is_random_each_call():
     cipher = crypto.SessionCipher(key)
     wire1 = cipher.encrypt(b"same-plaintext")
     wire2 = cipher.encrypt(b"same-plaintext")
-    assert wire1 != wire2  # 不同随机 nonce -> 不同密文,防止重放/模式分析
+    assert wire1 != wire2  # 不同随机 nonce -> 不同密文,避免密文模式分析
+
+
+def test_replayed_wire_message_rejected():
+    key = _derive("pw", crypto.new_salt())
+    cipher_a = crypto.SessionCipher(key, aad=b"s")
+    cipher_b = crypto.SessionCipher(key, aad=b"s")
+    wire = cipher_a.encrypt(b"click at (10, 20)")
+    assert cipher_b.decrypt(wire) == b"click at (10, 20)"
+    # 原样重放同一条密文(哪怕内容和 tag 都合法)必须被拒绝
+    with pytest.raises(crypto.CryptoError):
+        cipher_b.decrypt(wire)
+
+
+def test_replay_window_evicts_oldest_nonce():
+    key = _derive("pw", crypto.new_salt())
+    cipher_a = crypto.SessionCipher(key, aad=b"s")
+    cipher_b = crypto.SessionCipher(key, aad=b"s", replay_window=2)
+    wires = [cipher_a.encrypt(f"msg-{i}".encode()) for i in range(3)]
+    for wire in wires:
+        cipher_b.decrypt(wire)
+    # 窗口容量为 2,最早的 nonce 应该已被淘汰,重放它不应再被检测为"重复"
+    # (说明窗口确实有界,不会无限增长——但这不代表能被解密两次仍返回同样内容,
+    # 只是意味着淘汰后的旧 nonce 不再占用去重表空间)
+    assert wires[0] not in cipher_b._seen_nonces
 
 
 def test_session_key_length_enforced():

@@ -27,10 +27,21 @@ wss:// (TLS) 之上,由传输层提供;应用层的 AES-GCM 加密仍然提供�
 
 出于防暴力破解考虑,host/relay 侧应对握手失败次数做速率限制
 (实现见 host/server.py 的 AuthRateLimiter)。
+
+防重放:AES-GCM 本身只保证"篡改会被发现",并不保证"同一条密文不会被
+原样重发"——一个能截获流量的中间人(例如被攻陷的中转服务器,或直连
+模式下的链路层攻击者)完全可以把一条曾经真实出现过的合法密文
+`[nonce][ciphertext]` 原样重发,解密照样成功。由于每次 `encrypt()` 都用
+`os.urandom` 生成全新的随机 nonce,正常流量里同一个 nonce 不会出现第二
+次;因此 `SessionCipher` 在会话内维护一个"最近见过的 nonce"集合,一旦
+识别到重复的 nonce 就拒绝解密,从而挡住"原样重放历史密文"这类攻击
+(例如重放一次鼠标点击或按键)。这个集合按插入顺序做了容量上限,避免
+长连接下无限增长。
 """
 from __future__ import annotations
 
 import base64
+import collections
 import os
 
 from cryptography.exceptions import InvalidTag
@@ -44,6 +55,7 @@ SALT_BYTES = 16
 NONCE_BYTES = 12
 KEY_BYTES = 32
 HKDF_INFO = b"remotedesktop-session-key-v1"
+REPLAY_WINDOW = 20_000  # 会话内记住的最近 nonce 数量上限
 
 
 class CryptoError(Exception):
@@ -77,13 +89,16 @@ def derive_session_key(*, password: str, salt: bytes, iterations: int = PBKDF2_I
 
 
 class SessionCipher:
-    """封装某一条已建立连接的 AES-256-GCM 加解密操作。"""
+    """封装某一条已建立连接的 AES-256-GCM 加解密操作,并做会话内防重放。"""
 
-    def __init__(self, session_key: bytes, aad: bytes = b""):
+    def __init__(self, session_key: bytes, aad: bytes = b"", replay_window: int = REPLAY_WINDOW):
         if len(session_key) != KEY_BYTES:
             raise CryptoError("session key must be 32 bytes")
         self._aead = AESGCM(session_key)
         self._aad = aad
+        self._replay_window = replay_window
+        self._seen_nonces: set[bytes] = set()
+        self._nonce_order: collections.deque[bytes] = collections.deque()
 
     def encrypt(self, plaintext: bytes) -> bytes:
         nonce = os.urandom(NONCE_BYTES)
@@ -94,7 +109,18 @@ class SessionCipher:
         if len(wire_bytes) < NONCE_BYTES + 16:  # 16 = GCM tag 长度
             raise CryptoError("ciphertext too short")
         nonce, ciphertext = wire_bytes[:NONCE_BYTES], wire_bytes[NONCE_BYTES:]
+        if nonce in self._seen_nonces:
+            raise CryptoError("replayed nonce detected")
         try:
-            return self._aead.decrypt(nonce, ciphertext, self._aad)
+            plaintext = self._aead.decrypt(nonce, ciphertext, self._aad)
         except InvalidTag as exc:
             raise CryptoError("decryption failed (wrong password or tampered data)") from exc
+        self._remember_nonce(nonce)
+        return plaintext
+
+    def _remember_nonce(self, nonce: bytes) -> None:
+        self._seen_nonces.add(nonce)
+        self._nonce_order.append(nonce)
+        if len(self._nonce_order) > self._replay_window:
+            oldest = self._nonce_order.popleft()
+            self._seen_nonces.discard(oldest)

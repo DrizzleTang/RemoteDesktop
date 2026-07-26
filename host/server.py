@@ -57,8 +57,18 @@ HELLO_TIMEOUT_S = 8.0
 MAX_FAILED_AUTH_PER_WINDOW = 5
 AUTH_WINDOW_S = 60.0
 AUTH_BLOCK_S = 120.0
+# 中转模式下,host 侧看到的"来源 IP"其实是中转服务器自己的地址,不是真正
+# 发起连接的一方——relay 只透传密文,没有办法把真实来源信息可信地转交
+# 给 host。也就是说,中转模式下这套限速本质上是"按这个 host 的中转身份
+# 整体限速",而不是真正意义上的"按攻击者身份限速":一旦触发封禁,会连带
+# 挡住此后经由同一中转服务器过来的所有人(包括真正的机主)。因此中转模式
+# 下用一个明显更短的封禁时长,在"拖慢暴力破解"与"少殃及正常用户"之间
+# 折中(直连模式下 peer_ip 是真实客户端地址,限速判断准确,继续用完整的
+# AUTH_BLOCK_S)。详见 docs/architecture.md "安全设计取舍说明"。
+RELAY_AUTH_BLOCK_S = 15.0
 MAX_WS_MESSAGE_BYTES = 8 * 1024 * 1024
 SEND_QUEUE_MAXSIZE = 64
+CLIPBOARD_MIN_APPLY_INTERVAL_S = 0.3  # 限制 clip 消息处理频率,避免被用来刷剪贴板子进程
 
 
 @dataclass
@@ -88,15 +98,15 @@ class AuthRateLimiter:
             return False
         return True
 
-    def record_failure(self, ip: str) -> None:
+    def record_failure(self, ip: str, block_seconds: float = AUTH_BLOCK_S) -> None:
         now = time.monotonic()
         window_start = now - AUTH_WINDOW_S
         attempts = [t for t in self._failures.get(ip, []) if t >= window_start]
         attempts.append(now)
         self._failures[ip] = attempts
         if len(attempts) >= MAX_FAILED_AUTH_PER_WINDOW:
-            self._blocked_until[ip] = now + AUTH_BLOCK_S
-            logger.warning("IP %s 短时间内认证失败次数过多,临时封禁 %.0f 秒", ip, AUTH_BLOCK_S)
+            self._blocked_until[ip] = now + block_seconds
+            logger.warning("IP %s 短时间内认证失败次数过多,临时封禁 %.0f 秒", ip, block_seconds)
 
     def record_success(self, ip: str) -> None:
         self._failures.pop(ip, None)
@@ -133,6 +143,7 @@ class Session:
         self._frame_sent_at: float = 0.0
         self._frame_ack_event = asyncio.Event()
         self._recent_frames: list[tuple[float, int]] = []  # (发送时间, 字节数),用于统计实际 fps/码率
+        self._last_clipboard_apply_ts: float = 0.0
         self._start_ts = time.monotonic()
         self._loop = asyncio.get_event_loop()
 
@@ -239,9 +250,7 @@ class Session:
                 if self.injector:
                     self.injector.key(code=msg.get("code"), key_char=msg.get("key"), down=bool(msg["down"]))
             elif t == T_CLIPBOARD:
-                text = msg.get("text", "")
-                if isinstance(text, str) and self.clipboard:
-                    self.clipboard.apply_remote(text)
+                await self._on_clipboard_message(msg)
             elif t == T_QUALITY_SET:
                 self._on_quality_set(msg)
             elif t == T_BYE:
@@ -250,6 +259,23 @@ class Session:
             pass
         except (KeyError, ValueError, TypeError) as exc:
             logger.debug("忽略格式错误的控制消息 %s: %s", t, exc)
+        except Exception:  # noqa: BLE001 - 输入注入库(pynput/mss/pyperclip)可能抛出
+            # 各种非 KeyError/ValueError/TypeError 的平台相关异常(例如 pynput 在
+            # 某些按键释放路径上会抛出继承自 Exception 的 InvalidKeyException);
+            # 一条畸形/极端的控制消息不应该把整个会话的 recv_loop 直接打崩。
+            logger.exception("处理控制消息 %s 时发生未预期异常,已忽略", t)
+
+    async def _on_clipboard_message(self, msg: dict) -> None:
+        text = msg.get("text", "")
+        if not isinstance(text, str) or not self.clipboard:
+            return
+        now = time.monotonic()
+        if now - self._last_clipboard_apply_ts < CLIPBOARD_MIN_APPLY_INTERVAL_S:
+            return  # 简单限流:防止刷 clip 消息导致反复拉起剪贴板子进程
+        self._last_clipboard_apply_ts = now
+        # pyperclip 在 Linux 下通过子进程(xclip/xsel)读写剪贴板,是阻塞调用,
+        # 必须放到线程池里执行,避免卡住 asyncio 事件循环(进而卡住整条会话)。
+        await self._loop.run_in_executor(None, self.clipboard.apply_remote, text)
 
     def _on_frame_ack(self, msg: dict) -> None:
         if msg.get("seq") != self._pending_frame_seq:
@@ -350,7 +376,8 @@ class Session:
             await self._handshake()
         except crypto.CryptoError:
             logger.info("认证失败(密码错误),来源 %s", self.peer_ip)
-            self.rate_limiter.record_failure(self.peer_ip)
+            block_s = RELAY_AUTH_BLOCK_S if self.config.relay_url else AUTH_BLOCK_S
+            self.rate_limiter.record_failure(self.peer_ip, block_seconds=block_s)
             await self._safe_close()
             return
         except (asyncio.TimeoutError, protocol.ProtocolError, ConnectionClosed, OSError) as exc:
@@ -375,6 +402,12 @@ class Session:
             await asyncio.gather(*tasks, return_exceptions=True)
             if self.clipboard:
                 self.clipboard.stop()
+            # capture_executor 是单线程池,任务严格按提交顺序执行;取消
+            # _frame_loop 只是不再提交新的 grab_and_encode 调用,并不能中断
+            # 一次已经在执行中的调用。这里提交一个空任务并等待它完成,借助
+            # "单线程 FIFO"的性质确保上一次 grab_and_encode(如果还在跑)已经
+            # 结束,再去关闭底层的 mss 实例,避免跨线程并发访问同一个对象。
+            await self._loop.run_in_executor(self.capture_executor, lambda: None)
             self.capture.close()
             await self._safe_close()
             logger.info("会话已结束,来源 %s", self.peer_ip)

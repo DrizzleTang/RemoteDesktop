@@ -16,8 +16,12 @@ def _random_password(length: int = 8) -> str:
     return "".join(secrets.choice(alphabet) for _ in range(length))
 
 
-def _random_session_id(length: int = 8) -> str:
-    return "".join(secrets.choice(string.digits) for _ in range(length))
+def _random_session_id(length: int = 10) -> str:
+    # 字母数字混合(而不是纯数字)以获得更大的猜测空间,降低中转模式下
+    # 会话码在配对等待期间被抢注/暴力枚举的可行性(见 docs/relay_protocol.md
+    # 与 relay/server.py 里 ID_RE 的说明)。
+    alphabet = string.ascii_uppercase + string.digits
+    return "".join(secrets.choice(alphabet) for _ in range(length))
 
 
 def build_arg_parser() -> argparse.ArgumentParser:

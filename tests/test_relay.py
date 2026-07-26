@@ -25,10 +25,11 @@ from relay.server import ID_RE, RelayServer, _RateLimiter
 @pytest.mark.parametrize(
     "value,expected",
     [
-        ("AB12", True),
+        ("AB12CD", True),
         ("a" * 32, True),
         ("a" * 33, False),  # 超过最大长度
-        ("abc", False),  # 长度不足 4
+        ("AB12", False),  # 长度不足 6(最短长度从 4 提高到 6,降低短 id 被抢注的概率)
+        ("abc", False),
         ("", False),
         ("has space", False),
         ("has-dash", False),
@@ -283,5 +284,54 @@ async def test_max_connections_limit_rejects_new_connection():
             async with websockets.connect(uri) as ws2:
                 with pytest.raises(websockets.exceptions.ConnectionClosed):
                     await asyncio.wait_for(ws2.recv(), timeout=3)
+    finally:
+        await cleanup()
+
+
+async def test_forward_rate_limits_are_independent_per_direction():
+    # 回归测试:host->client 和 client->host 曾经共用同一个令牌桶限速器,
+    # 导致双向流量互相挤占预算。这里验证每个方向各自有独立的 16 字节/秒
+    # 预算——一个方向刚刚把预算用尽,不应该影响另一个方向的转发。
+    server, uri, cleanup = await _start_server(
+        register_timeout=5.0,
+        pairing_wait_timeout=5.0,
+        sweep_interval=1.0,
+        forward_rate_limit_bytes_per_sec=16,
+    )
+    try:
+        session_id = "DIRINDEP"
+        async with websockets.connect(uri) as host_ws, websockets.connect(uri) as client_ws:
+            await _register(host_ws, "host", session_id)
+            await host_ws.recv()
+            await _register(client_ws, "client", session_id)
+            await client_ws.recv()
+            await host_ws.recv()
+
+            # host -> client 方向先把自己的预算用满(16 字节)
+            await host_ws.send(b"h" * 16)
+            assert await client_ws.recv() == b"h" * 16
+
+            # 紧接着 client -> host 方向发送同等大小的消息;如果两个方向共用
+            # 同一个令牌桶,这里的预算会因为上面那次发送而被耗尽,消息会被
+            # 丢弃。方向独立时,这条消息应当能正常转发到 host。
+            await client_ws.send(b"c" * 16)
+            got = await asyncio.wait_for(host_ws.recv(), timeout=3)
+            assert got == b"c" * 16
+    finally:
+        await cleanup()
+
+
+async def test_stale_register_attempts_are_swept():
+    server, uri, cleanup = await _start_server(
+        register_timeout=5.0, sweep_interval=0.1,
+        register_rate_limit_count=100, register_rate_limit_window=0.2,
+    )
+    try:
+        assert server._check_register_rate_limit("9.9.9.9") is True
+        assert "9.9.9.9" in server._register_attempts
+
+        # 等待:窗口过期 + 至少一轮后台清理
+        await asyncio.sleep(0.5)
+        assert "9.9.9.9" not in server._register_attempts
     finally:
         await cleanup()

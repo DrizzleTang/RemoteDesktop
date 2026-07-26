@@ -54,6 +54,12 @@ _SPECIAL_CODE_NAMES: dict[str, str] = {
 
 _BUTTON_NAMES = {"left": "left", "right": "right", "middle": "middle"}
 
+# 单条 mscroll 消息允许的最大滚动量(以"格"为单位)。一次真实的鼠标滚轮
+# 事件通常只有 1~10 格;有的后端(如 pynput 的 X11 实现)会把较大的 scroll
+# 幅度展开成多次同步的 X11 往返调用,不做上限校验的话,一条被篡改/伪造的
+# 超大 mscroll 消息就可能把事件循环阻塞很长时间,变成一种简单的 DoS。
+MAX_SCROLL_PER_MESSAGE = 100
+
 
 class InputInjector:
     def __init__(self, screen_width: int, screen_height: int):
@@ -99,6 +105,8 @@ class InputInjector:
                 self._mouse.release(button_obj)
 
     def scroll(self, dx: float, dy: float) -> None:
+        dx = max(-MAX_SCROLL_PER_MESSAGE, min(MAX_SCROLL_PER_MESSAGE, dx))
+        dy = max(-MAX_SCROLL_PER_MESSAGE, min(MAX_SCROLL_PER_MESSAGE, dy))
         with self._lock:
             self._mouse.scroll(dx, dy)
 

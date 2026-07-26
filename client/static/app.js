@@ -20,14 +20,23 @@ const MSG_CONTROL = 1;
 const MSG_VIDEO_FRAME = 2;
 const FRAME_MAGIC = 0xf1;
 const FRAME_HEADER_BYTES = 16;
+const MAX_FRAME_DIMENSION = 8192; // 防止被篡改的宽高把 canvas/内存撑爆
 const HKDF_INFO = 'remotedesktop-session-key-v1';
 const PING_INTERVAL_MS = 1000;
 const MOUSE_MOVE_THROTTLE_MS = 33; // ~30Hz,弱网下没必要发更密
+const REPLAY_WINDOW = 20000; // 会话内记住的最近 nonce 数量上限,防重放
+const MIN_KEX_ITERATIONS = 100000; // 低于此值视为被篡改/降级攻击,直接拒绝
+const MAX_KEX_ITERATIONS = 2000000;
+const KEX_SALT_MIN_BYTES = 8;
+const KEX_SALT_MAX_BYTES = 64;
 
 const state = {
   ws: null,
   aesKey: null,
   saltBytes: null,
+  handshakeStarted: false, // 已经处理过一次 kex_init;之后再收到的一律忽略
+  seenNonces: new Set(),
+  nonceOrder: [],
   connected: false,
   manualClose: false,
   connectionParams: null,
@@ -108,6 +117,27 @@ function base64ToBytes(b64) {
   return bytes;
 }
 
+function bytesToHex(bytes) {
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+// 防重放:AES-GCM 只保证篡改会被发现,不保证同一条密文不会被原样重发
+// (例如被攻陷的中转服务器,或直连模式下的链路中间人)。正常流量的 nonce
+// 每次都是新随机生成的,因此在会话内记住"最近见过的 nonce",拒绝重复值,
+// 就能挡住"原样重放一条历史指令(比如一次点击/按键)"这类攻击。
+function isNonceReplayed(nonceKey) {
+  return state.seenNonces.has(nonceKey);
+}
+
+function rememberNonce(nonceKey) {
+  state.seenNonces.add(nonceKey);
+  state.nonceOrder.push(nonceKey);
+  if (state.nonceOrder.length > REPLAY_WINDOW) {
+    const oldest = state.nonceOrder.shift();
+    state.seenNonces.delete(oldest);
+  }
+}
+
 function showToast(msg, ms = 2500) {
   toast.textContent = msg;
   toast.style.display = 'block';
@@ -145,9 +175,14 @@ async function encryptMessage(kind, payloadBytes) {
 async function decryptMessage(wireBytes) {
   const nonce = wireBytes.slice(0, 12);
   const ciphertext = wireBytes.slice(12);
+  const nonceKey = bytesToHex(nonce);
+  if (isNonceReplayed(nonceKey)) {
+    throw new Error('replayed nonce detected');
+  }
   const plaintextBuf = await crypto.subtle.decrypt(
     { name: 'AES-GCM', iv: nonce, additionalData: state.saltBytes }, state.aesKey, ciphertext,
   );
+  rememberNonce(nonceKey);
   return new Uint8Array(plaintextBuf);
 }
 
@@ -218,6 +253,9 @@ function connect(params) {
   state.ws = ws;
   state.aesKey = null;
   state.saltBytes = null;
+  state.handshakeStarted = false;
+  state.seenNonces = new Set();
+  state.nonceOrder = [];
 
   ws.onopen = () => {
     if (params.mode === 'relay') {
@@ -238,9 +276,14 @@ function connect(params) {
   ws.onclose = () => handleClose();
 }
 
+function isPlainMessageObject(value) {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
 function safeJsonParse(text) {
   try {
-    return JSON.parse(text);
+    const parsed = JSON.parse(text);
+    return isPlainMessageObject(parsed) ? parsed : {};
   } catch {
     return {};
   }
@@ -265,6 +308,7 @@ async function handleEncryptedMessage(wireBytes) {
     } catch {
       return;
     }
+    if (!isPlainMessageObject(msg)) return;
     handleControlMessage(msg);
   } else if (kind === MSG_VIDEO_FRAME) {
     handleVideoFrame(body);
@@ -299,11 +343,44 @@ function handlePlaintextMessage(msg) {
 }
 
 async function onKexInit(msg) {
+  // 握手只应该发生一次:一旦处理过第一条 kex_init(无论成功与否),后续
+  // 连接生命周期内再收到的 kex_init 一律视为异常/攻击尝试并忽略,防止
+  // 恶意中转方或链路中间人在会话中途注入一条新的 kex_init 让 client 重新
+  // 派生密钥、进而扰乱或劫持已建立的加密会话状态。
+  if (state.handshakeStarted) {
+    console.warn('忽略重复的 kex_init(握手已完成或正在进行)');
+    return;
+  }
+  state.handshakeStarted = true;
+
+  const iterations = msg.iterations;
+  if (typeof iterations !== 'number' || !Number.isInteger(iterations)
+      || iterations < MIN_KEX_ITERATIONS || iterations > MAX_KEX_ITERATIONS) {
+    console.error('kex_init 的 iterations 字段不合法或超出安全范围,拒绝握手', iterations);
+    setConnectError('握手参数异常,已拒绝连接(可能存在中间人篡改)');
+    state.ws && state.ws.close();
+    return;
+  }
+
+  let saltBytes;
   try {
-    state.saltBytes = base64ToBytes(msg.salt);
-    state.aesKey = await deriveSessionKey(
-      state.connectionParams.password, state.saltBytes, msg.iterations || 200000,
-    );
+    saltBytes = base64ToBytes(msg.salt);
+  } catch (err) {
+    console.error('kex_init 的 salt 字段无法解码', err);
+    setConnectError('握手参数异常,已拒绝连接');
+    state.ws && state.ws.close();
+    return;
+  }
+  if (saltBytes.length < KEX_SALT_MIN_BYTES || saltBytes.length > KEX_SALT_MAX_BYTES) {
+    console.error('kex_init 的 salt 长度不合法', saltBytes.length);
+    setConnectError('握手参数异常,已拒绝连接');
+    state.ws && state.ws.close();
+    return;
+  }
+
+  try {
+    state.saltBytes = saltBytes;
+    state.aesKey = await deriveSessionKey(state.connectionParams.password, state.saltBytes, iterations);
     setStatus('connecting', '正在验证密码...');
     await sendControl({ t: 'hello', client_name: navigator.userAgent.slice(0, 60) });
     startPingLoop();
@@ -405,6 +482,10 @@ function handleVideoFrame(body) {
   const seq = dv.getUint32(1);
   const width = dv.getUint16(9);
   const height = dv.getUint16(11);
+  if (width === 0 || height === 0 || width > MAX_FRAME_DIMENSION || height > MAX_FRAME_DIMENSION) {
+    console.warn('丢弃宽高异常的视频帧', width, height);
+    return;
+  }
   const imageBytes = body.subarray(FRAME_HEADER_BYTES);
 
   const blob = new Blob([imageBytes], { type: 'image/jpeg' });
