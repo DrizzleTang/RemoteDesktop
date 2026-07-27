@@ -16,7 +16,52 @@ import os
 import socketserver
 import sys
 import threading
+import traceback
 import webbrowser
+
+
+def _safe_print(*args, **kwargs) -> None:
+    """尽量打印,但绝不能因为打印本身崩溃退出。
+
+    打包成 --noconsole 的 exe(主控端就是)后,没有控制台窗口时 stdout/stderr
+    在某些 Windows 环境下会是 None 或者一个写入即报错的坏文件描述符——这会导致
+    程序在还没显示任何东西之前就直接崩溃退出,表现就是"双击完全没反应"。
+    """
+    try:
+        print(*args, **kwargs)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _crash_log_path() -> str:
+    base = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.getcwd()
+    return os.path.join(base, "RemoteDesktop-Client-错误日志.txt")
+
+
+def _report_fatal_error(exc: BaseException) -> None:
+    """没有控制台窗口时用户看不到任何报错,这里把详情写进 exe 旁边的文件,
+    并在 Windows 下额外弹一个消息框,保证"启动失败"不会表现成"毫无反应"。"""
+    detail = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    try:
+        with open(_crash_log_path(), "w", encoding="utf-8") as f:
+            f.write(detail)
+    except Exception:  # noqa: BLE001
+        pass
+    if sys.platform.startswith("win"):
+        try:
+            import ctypes
+
+            port_hint = ""
+            if isinstance(exc, OSError):
+                port_hint = "\n\n常见原因:端口已被占用(比如主控端已经在运行了,或被其他程序占用)。"
+            ctypes.windll.user32.MessageBoxW(
+                None,
+                f"启动失败: {exc}{port_hint}\n\n详细信息已写入:\n{_crash_log_path()}",
+                "远程桌面 - 主控端",
+                0x10,  # MB_ICONERROR
+            )
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def _static_dir() -> str:
@@ -48,7 +93,7 @@ def main() -> None:
     args = build_arg_parser().parse_args()
     static_dir = _static_dir()
     if not os.path.isdir(static_dir):
-        print(f"错误: 找不到静态资源目录 {static_dir}")
+        _safe_print(f"错误: 找不到静态资源目录 {static_dir}")
         sys.exit(1)
 
     def handler_factory(*a, **kw):
@@ -57,18 +102,27 @@ def main() -> None:
     socketserver.TCPServer.allow_reuse_address = True
     with socketserver.TCPServer(("127.0.0.1", args.port), handler_factory) as httpd:
         url = f"http://127.0.0.1:{args.port}/"
-        print("=" * 56)
-        print(" 远程桌面 - 主控端 已启动")
-        print(f" 请在浏览器中打开: {url}")
-        print(" 按 Ctrl+C 退出")
-        print("=" * 56)
+        _safe_print("=" * 56)
+        _safe_print(" 远程桌面 - 主控端 已启动")
+        _safe_print(f" 请在浏览器中打开: {url}")
+        _safe_print(" 按 Ctrl+C 退出")
+        _safe_print("=" * 56)
         if not args.no_browser:
             threading.Timer(0.6, lambda: webbrowser.open(url)).start()
         try:
             httpd.serve_forever()
         except KeyboardInterrupt:
-            print("\n已退出。")
+            _safe_print("\n已退出。")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except SystemExit:
+        raise
+    except KeyboardInterrupt:
+        _safe_print("\n已退出。")
+    except Exception as exc:  # noqa: BLE001 - 顶层入口:任何异常都要能被用户看到,不能悄无声息地退出
+        _safe_print(f"启动失败: {exc}")
+        _report_fatal_error(exc)
+        sys.exit(1)

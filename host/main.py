@@ -4,9 +4,12 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
 import secrets
 import socket
 import string
+import sys
+import traceback
 from pathlib import Path
 
 from host import password_policy
@@ -14,6 +17,35 @@ from host.server import HostConfig, HostServer
 from host.tray import TrayIcon
 
 DEFAULT_DOWNLOAD_DIR = Path.home() / "RemoteDesktop-收到的文件"
+
+
+def _pause_if_frozen() -> None:
+    """打包成 exe 双击运行时,控制台窗口会在进程退出的瞬间被 Windows 自动关闭,
+    错误信息一闪而过根本来不及看。这里在异常退出前停一下,等用户按键确认。"""
+    if getattr(sys, "frozen", False):
+        try:
+            input("\n按回车键退出...")
+        except (EOFError, KeyboardInterrupt):
+            pass
+
+
+def _crash_log_path() -> str:
+    base = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.getcwd()
+    return os.path.join(base, "RemoteDesktop-Host-错误日志.txt")
+
+
+def _is_address_in_use(exc: OSError) -> bool:
+    return exc.errno in (98, 10048) or "10048" in str(exc) or "Address already in use" in str(exc)
+
+
+def _report_fatal_error(exc: BaseException) -> None:
+    detail = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    print(detail)
+    try:
+        with open(_crash_log_path(), "w", encoding="utf-8") as f:
+            f.write(detail)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _random_password(length: int = 10) -> str:
@@ -147,4 +179,23 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except SystemExit:
+        raise
+    except KeyboardInterrupt:
+        print("\n已退出。")
+    except OSError as exc:
+        if _is_address_in_use(exc):
+            print(f"\n启动失败: 端口可能已被占用(比如已有一个被控端在运行)。"
+                  f"可以加 --port 换个端口再试一次。\n({exc})")
+        else:
+            print(f"\n启动失败: {exc}")
+        _report_fatal_error(exc)
+        _pause_if_frozen()
+        sys.exit(1)
+    except Exception as exc:  # noqa: BLE001 - 顶层入口:任何异常都要能被用户看到,不能一闪而过
+        print(f"\n启动失败,出现了预料之外的错误: {exc}")
+        _report_fatal_error(exc)
+        _pause_if_frozen()
+        sys.exit(1)
